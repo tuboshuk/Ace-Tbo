@@ -1,0 +1,8 @@
+name,sector_type,timestamp,super_large_net_inflow,large_net_inflow,medium_net_inflow,small_net_inflow,main_net_inflow_pct,change_pct,leading_stock,inflow_stock_count,provider,period
+电池,industry,2026-07-06T10:30:00,900000000,650000000,120000000,-380000000,6.20,2.80,宁德时代,38,demo,today
+白酒,industry,2026-07-06T10:30:00,120000000,50000000,20000000,-90000000,1.20,0.50,贵州茅台,12,demo,today
+银行,industry,2026-07-06T10:30:00,-350000000,-280000000,40000000,210000000,-3.40,-1.10,招商银行,5,demo,today
+半导体,industry,2026-07-06T10:30:00,480000000,360000000,90000000,-170000000,5.30,1.90,中芯国际,41,demo,today
+汽车整车,industry,2026-07-06T10:30:00,240000000,210000000,70000000,-110000000,2.60,2.20,比亚迪,20,demo,today
+证券,industry,2026-07-06T10:30:00,-100000000,-260000000,30000000,210000000,-2.70,6.80,东方财富,9,demo,today
+

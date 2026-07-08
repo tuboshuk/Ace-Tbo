@@ -1,0 +1,22 @@
+[project]
+name = "a-share-wealth-lab"
+version = "0.1.0"
+description = "Personal finance learning, A-share rules, paper trading, and backtesting lab."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+data = [
+  "akshare",
+  "efinance",
+  "baostock",
+  "pandas",
+]
+
+[project.scripts]
+wealth-lab = "wealth_lab.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
