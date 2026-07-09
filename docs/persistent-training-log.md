@@ -1095,3 +1095,374 @@
   - 不调 `opening_guard`、支撑距离、仓位权重。
   - 先解决资金流历史数据稳定来源，或建立可审计的资金流缓存/离线数据集；否则 100-300 股扩样统计会被数据错误污染。
   - 在资金流数据稳定前，错过机会分析只能基于已经有效的 50/100 历史报告和本轮 32 个有效样本，不能宣称覆盖了 300 股池。
+
+## 动作 036 - 扩池有效样本补足与突破前观察层
+
+- 遇到了什么问题？
+  - 用户明确要求先修扩池数据错误：`100` 只必须真的有 `100` 只有效，`300` 只必须真的有 `300` 只有效，否则验证不成立。
+  - 上一轮 `300` 池只有 `32/300` 有效，其中多数错误来自资金流接口失败。把资金流接口失败当作整只股票失败，会把数据源不可用误判成策略样本不足。
+  - 当前主策略 `volume_price_breakout_opening_guard_probe` 不能再随便增加确认条件；`opening_guard` 在错过机会里不是主因。
+  - `normal`、`dry_up_base`、`quiet_consolidation`、`shrink_pullback` 中存在后续大涨样本，但这些节点历史上也有失败簇，不能直接重新开放买入。
+
+- 打算怎么做？
+  - 不修改 `volume_price_breakout_opening_guard_probe` 的买入、卖出、仓位和 `opening_guard` 参数。
+  - `validate-expansion` 不再只抽正好 `N` 只股票，而是抽取更大的候选队列；训练时跳过历史 K 线不可回放的股票，直到最大池补足 `N` 个有效回放结果。
+  - 资金流历史接口失败时不再让整只股票报错，而是降级为空资金流/低覆盖样本继续跑回放；报告中单独显示 `no_fund_flow_symbols`、`avg_fund_flow_coverage`、`missing_fund_flow_dates`。
+  - 新增“突破前观察层”：只把 `normal`、`dry_up_base`、`quiet_consolidation`、`shrink_pullback` 中未来 5 根 K 线最大涨幅达到 `10%` 的节点记录为 watchlist，不直接买入。
+  - 新增二段式诊断：第一段发现潜在启动加入观察；第二段只有后续出现 `volume_breakout`，且站稳、放量、资金不转弱，才记录是否交接给当前主策略和 `opening_guard`。
+
+- 这么做有什么意义？
+  - 扩池验证先证明“样本数量真实有效”，避免 100/300 统计被数据错误污染。
+  - 资金流缺失被明确降级为低覆盖证据，而不是伪装成完整主力资金模型；这保留了科学验证边界。
+  - 观察层把“错过的大涨普通节点”转成可复盘样本，但不破坏当前主策略纪律，避免回到 shrink/quiet/dry-up 直接买入的旧错误。
+  - 二段式输出能回答：哪些非突破节点只是观察，哪些后续真的出现突破确认，哪些已经可以交给 `opening_guard` 主策略处理。
+
+- 需要改什么？
+  - 修改 `src/wealth_lab/stock_pool.py`：`NestedStockPoolSelection` 增加 `candidate_symbols`，`select_nested_random_a_share_pools()` 支持 `candidate_count` 过采样候选队列。
+  - 修改 `src/wealth_lab/cli.py`：`validate-expansion` 默认抽取最大池 `3x` 候选，使用 `required_valid_symbols` 补足最大有效池，再用有效前缀派生小池。
+  - 修改 `src/wealth_lab/training.py`：新增 `TrainingFundFlowFetcher`，资金流失败降级为空覆盖；新增无资金信号状态 fallback；新增 `PreBreakoutObservation`、观察层统计、数据覆盖聚合、报告渲染。
+  - 修改 `src/wealth_lab/replay.py`：`ReplayResult` 保留 `fund_flows`，供观察层判断后续确认日资金是否转弱。
+  - 修改 `tests/test_stock_pool.py` 和 `tests/test_training.py`：覆盖候选过采样、无资金流有效回放、观察层 watch -> volume_breakout handoff、报告输出。
+
+- 本轮验证结果
+  - 针对性测试：`python -m pytest tests\test_stock_pool.py tests\test_training.py -q` -> `22 passed`。
+  - 全量测试：`python -m pytest -q` -> `107 passed`。
+  - 小池 CLI 验证：`python run.py validate-expansion --pool-sizes 2 3 --random-seed 20260708 --days 90 --initial-cash 100000`。
+  - 小池结果：候选数 `9`，目标最大池 `3`，最终 `3/3` 有效；派生 `2/2` 有效，扩样总表落盘 `runtime/training/20260708T093043Z-expansion-validation-summary.md`。
+  - 小池数据覆盖：`no_fund_flow_symbols=3`、`avg_fund_flow_coverage=0.00%`，说明当前环境下资金流仍不可用，但不会再阻断有效 K 线回放。
+
+- 是否达到年收益 10.00%？
+  - 否。本轮是扩池有效性和观察层改造，不是收益参数调优；主策略交易规则没有变化。
+  - 小池验证没有闭合交易，不构成收益证据。
+
+- 下一步
+  - 用新 `validate-expansion` 重新跑 `50/100/300`，验证 `valid_symbols` 是否能分别达到 `50/100/300`。
+  - 重点看 `Pre-Breakout Observation Layer` 中哪些观察节点后续真的交接给 `volume_breakout`，再决定是否需要把观察层变成独立候选，而不是直接买入。
+
+## 动作 037 - 二段式观察池执行实验与目标带报告
+
+- 遇到了什么问题？
+  - 扩池有效性和突破前观察层已经修到可以落盘，但观察层仍只是诊断：它能告诉我们哪些 `normal/dry_up_base/quiet_consolidation/shrink_pullback` 后来涨了，却不会参与交易执行。
+  - 当前主策略 `volume_price_breakout_opening_guard_probe` 不能被随便改动；它要保留为确认买入层和主策略基准。
+  - 用户要求的目标已经不只是年化 10%，还包括资金利用率、平均仓位、月交易次数、单笔亏损和月最大回撤，但报告里还缺一张直接对照这些目标带的表。
+- 打算怎么做？
+  - 不修改默认候选池，默认仍只运行 `volume_price_breakout_opening_guard_probe`。
+  - 新增显式实验候选 `volume_price_pre_breakout_watchlist_opening_guard_probe`：第一段只把非突破节点放入观察池；第二段只有后续出现 `volume_breakout`、价格站稳、成交量扩张、主力资金不转弱，才生成 next-open 买入候选；最终仍由原 `opening_guard` 决定是否成交。
+  - 给实验候选增加三档仓位：观察确认 5%，强突破确认 10%，连续确认 15%；风险仓位逻辑必须尊重该档位上限。
+  - 给实验候选增加硬退出：跌破支撑、1-2 个 bar 无跟随、主力资金转负、盈利后放量滞涨。
+  - 新增 `Execution Target Bands` 报告：持仓利用率 10%-25%、平均仓位 5%-15%、月有效交易 10-30、平均亏损单 1%-3%、月最大回撤 <=15%。
+- 这么做有什么意义？
+  - 这一步把“错过的大涨普通节点”从报告样本推进为可验证交易实验，但不破坏主策略基准。
+  - 它验证的不是“普通/缩量/横盘可以直接买”，而是“先观察，等后续承接证明，再交给现有开盘确认层”是否能提高覆盖率。
+  - 目标带报告能直接回答资金是否真的进入市场，而不是只看单笔期望或平均收益。
+- 需要改什么？
+  - 修改 `src/wealth_lab/trade_discipline.py`：新增观察池配置、三档仓位、仓位上限保护、主力资金转弱退出、盈利后放量滞涨退出。
+  - 修改 `src/wealth_lab/replay.py`：新增 `_PreBreakoutWatch` 状态机，记录 watch、handoff、cancel，并把观察池确认交给原 opening guard pending open 路径。
+  - 修改 `src/wealth_lab/training.py`：新增 `training_candidates_with_watchlist_probe()`、实验候选、月度/亏损/回撤指标和 `Execution Target Bands`。
+  - 修改 `src/wealth_lab/cli.py`：给 `train-replay` 和 `validate-expansion` 增加 `--include-watchlist-probe` 显式开关。
+  - 修改 `tests/test_volume_probe.py` 和 `tests/test_training.py`：覆盖观察池买入、主力流转弱退出、三档仓位上限、候选注册和报告输出。
+- 本轮验证结果
+  - 针对性测试：`python -m pytest tests\test_volume_probe.py tests\test_training.py -q` -> `58 passed`。
+  - 全量测试：`python -m pytest -q` -> `112 passed`。
+  - 空白检查：`git diff --check` 无错误，仅有 Windows 换行提示。
+  - 小池 CLI 验证：`python run.py validate-expansion --pool-sizes 2 3 --random-seed 20260708 --days 90 --initial-cash 100000 --include-watchlist-probe`。
+  - 小池结果：`3/3` 有效 symbol，摘要 `runtime/training/20260708T101303Z-summary.md`，扩池汇总 `runtime/training/20260708T101345Z-expansion-validation-summary.md`。
+  - 小池摘要同时包含主策略和实验候选，`Execution Target Bands` 正常输出；因 90 天 3 股池无闭合交易，两个候选均为 `OBSERVE`。
+- 是否达到年收益 10.00%？
+  - 否。本轮是执行结构和报告层改造，不是收益达标证明。
+  - 小池验证只证明二段式候选能跑通、能落盘、不会破坏主策略；没有闭合交易，不能用于收益判断。
+- 下一步
+  - 用 `--include-watchlist-probe` 跑 50/100/300 扩池，先确认有效样本分别达到 50/100/300。
+  - 比较主策略和二段式实验候选的闭合交易数、持仓利用率、平均仓位、月有效交易、亏损单和月最大回撤。
+  - 如果二段式实验相对主策略收益改善不足 5%，或只是增加噪音交易，就保留为观察实验，不进入主策略。
+
+## 动作 038 - 盈新发展单票月 10%目标复核
+
+- 遇到了什么问题？
+  - 用户要求先不看大股票池，单独跑盈新发展 `000620`，判断当前程序在这一只股票上是否能达到每月盈利 10%。
+  - 月 10% 是非常高的目标；即使用简单口径也约等于年化 120%，用复利口径约等于年化 213.84%。如果单票近一年收益为负，则无需再讨论是否接近该目标。
+- 打算怎么做？
+  - 用当前主策略 `volume_price_breakout_opening_guard_probe` 和显式二段式实验 `volume_price_pre_breakout_watchlist_opening_guard_probe` 同场回放。
+  - 命令使用 `--target-annual-return 120` 对应简单月 10% 的年度目标，并额外从 JSONL 计算实际月收益。
+- 这么做有什么意义？
+  - 这能回答一个很窄的问题：不靠扩池、不靠平均，单独看盈新发展这一只票，当前程序是否已经具备月 10%能力。
+  - 也能检查二段式观察池是否至少在该票上改善收益或资金利用率。
+- 需要改什么？
+  - 本轮不改交易逻辑，只运行验证命令并记录结果。
+  - 验证命令：`python run.py train-replay 000620 --days 370 --initial-cash 100000 --target-annual-return 120 --include-watchlist-probe`。
+- 本轮验证结果
+  - 训练落盘：`runtime/training/20260708T101754Z-summary.md` 和 `runtime/training/20260708T101754Z-training.jsonl`。
+  - 主策略：`2` 笔闭合交易，`0` 盈、`2` 亏，账户总收益 `-0.752%`，复合月收益约 `-0.0619%`，平均单笔 `-5.4784%`，持仓利用率 `3.6585%`，平均仓位 `0.3036%`。
+  - 二段式实验：`2` 笔闭合交易，`0` 盈、`2` 亏，账户总收益 `-0.662%`，复合月收益约 `-0.0545%`，平均单笔 `-5.4784%`，持仓利用率 `3.6585%`，平均仓位 `0.2604%`。
+  - 两笔交易均亏损：`2026-01-20 -> 2026-01-27` 为 `invalidated` 退出，收益 `-4.3103%`；`2026-05-18 -> 2026-05-22` 为 `no_follow_through` 退出，收益 `-6.6465%`。
+  - 数据限制：本次资金流覆盖为 `0/246`，`missing_fund_flow_dates=246`，因此不能把结果解释成完整主力资金模型验证；这是纯 K 线/量价回放在无资金流覆盖下的结果。
+- 是否达到每月盈利 10%？
+  - 否。两个候选都是负收益，实际月收益约为 `-0.06%`，离 `+10%/月` 差距极大。
+  - 单票样本只有 `2` 笔闭合交易，也低于 `30` 笔闭合交易的基本统计门槛，因此只能作为失败诊断，不能作为可推广策略证据。
+- 下一步
+  - 对 `000620` 的下一步不是加仓或追求月 10%，而是复盘为什么错过 `2025-10` 前后的大涨段：报告显示 missed big moves 为 `62`，主要归因 `ordinary_non_signal=43`、`not_volume_breakout=17`。
+  - 在资金流数据恢复前，不要把这只票上的“主力行为”结论说成已被程序证明。
+
+## 动作 039 - 盈新发展单票模拟盘月度账户收益表
+
+- 遇到了什么问题？
+  - 用户要求建立一个更接近真实模拟盘的账户口径：初始资金 `100000`，从 `2025-07-08` 到 `2026-07-08`，查看每个月收益和这一年总收益率。
+  - 上一轮 `train-replay --days 370` 只能给候选汇总和交易故事，不能直接给“每月账户权益变化”；而且 `--days` 口径不是用户指定的精确起止日期。
+- 打算怎么做？
+  - 不修改当前主策略 `volume_price_breakout_opening_guard_probe` 的买卖规则。
+  - 新增独立模拟盘命令 `paper-account`：按指定 `start/end/initial-cash` 抓取历史 K 线，复用当前主策略回放，按每月最后一个交易日权益计算月收益。
+  - 报告同时输出期初资金、期末权益、全年总收益、最大回撤、资金流覆盖、每月买卖次数、持仓天数、空仓天数和成交明细。
+- 这么做有什么意义？
+  - 这是从“策略候选统计”推进到“账户模拟盘统计”：能直接回答这一年账户到底有没有赚钱、哪个月赚钱或亏钱、资金是否真的进入市场。
+  - 精确日期口径可以避免 `--days` 滚动窗口和用户指定周期不一致，后续可以复用同一命令做其他股票或其他区间。
+  - 月度表暴露了当前主策略的核心问题：不是某个月大亏很多，而是一整年绝大多数月份没有交易，资金利用率很低。
+- 需要改什么？
+  - 新增 `src/wealth_lab/paper_account.py`：实现月度账户行、模拟盘报告、Markdown 渲染和单股回放落盘。
+  - 修改 `src/wealth_lab/cli.py`：新增 `python run.py paper-account <symbol> --start YYYY-MM-DD --end YYYY-MM-DD --initial-cash 100000`。
+  - 新增 `tests/test_paper_account.py`：覆盖按月权益计算、报告渲染和空权益曲线保护。
+- 本轮验证结果
+  - 针对性测试：`python -m pytest tests\test_paper_account.py tests\test_training.py -q` -> `19 passed`。
+  - 全量测试：`python -m pytest -q` -> `115 passed`。
+  - 空白检查：`git diff --check` 无错误，仅有 Windows 换行提示。
+  - 模拟盘命令：`python run.py paper-account 000620 --start 2025-07-08 --end 2026-07-08 --initial-cash 100000`。
+  - 模拟盘报告：`runtime/paper_account/20260708T102810Z-000620-paper-account.md`。
+  - 主策略：`volume_price_breakout_opening_guard_probe`；期初 `100000.00`，期末 `99736.00`，总收益 `-0.2640%`，最大回撤 `0.3836%`。
+  - 月度表现：`2025-07` 到 `2026-04` 均为 `0.0000%`；`2026-05` 为 `-0.2640%`；`2026-06` 和 `2026-07` 为 `0.0000%`。
+  - 成交明细：`2026-05-18` 买入 `1200` 股，买入价 `3.31`；`2026-05-22` 卖出 `1200` 股，卖出价 `3.09`，退出原因 `no_follow_through`。
+  - 数据限制：资金流覆盖 `0/243`，`missing_fund_flow_dates=243`，因此本次不能解释为完整主力资金模型验证，只能解释为无资金流覆盖下的量价主策略模拟盘。
+- 是否达到每月盈利 10% 或一年正收益？
+  - 否。该精确区间内全年账户收益为 `-0.2640%`，没有任何月份达到 `+10%`。
+  - 一年只有 `1` 次买入和 `1` 次卖出，说明当前主策略在单票 `000620` 上资金利用率严重不足；这比“卖出条件不够好”更关键。
+- 下一步
+  - 继续复盘 `000620` 在 `2025-10` 前后的错过机会：如果程序一直空仓，需要判断是没有识别到启动、识别到但不属于 `volume_breakout`，还是被开盘/支撑/资金条件过滤。
+  - 在资金流数据恢复前，不要用“主力吸筹/出货”解释这次模拟盘收益；应先把错过机会和无交易月份作为下一轮诊断重点。
+
+## 动作 040 - 强放量突破复制实验与仓位贡献测算
+
+- 遇到了什么问题？
+  - 用户追问前面 `10%/20%+` 的收益是如何做到的；复核后确认这不是账户年收益，而是 v029 中 `000592`、`600879` 两笔强突破交易的单笔股票收益。
+  - 如果要把这类收益变成账户收益，必须证明该结构可复制；否则把两笔大肉当成加仓依据就是小样本过拟合。
+  - 需要把“强突破”从主观描述变成可复用筛选条件，并在已有训练产物中离线验证。
+- 打算怎么做？
+  - 不修改主策略买卖条件，不提高仓位。
+  - 新增离线分析命令 `strong-breakout-study`，读取历史 `training.jsonl`，只筛选：
+    - `buy_type = breakout_start`
+    - `vpa_archetype = effort_vs_result_breakout`
+    - `stage = volume_node:volume_breakout`
+  - 输出该结构的样本数、交易股票数、胜率、平均收益、中位数收益、最大盈利、最大亏损、确认/警告/失效均值，以及固定 `5%/10%/15%/20%` 仓位下的账户贡献估算。
+- 这么做有什么意义？
+  - 这一步把 `000592/600879` 的成功样本从“看起来很强”变成可重复检索的交易簇。
+  - 账户贡献测算能直接回答：即使股票涨 `20%-30%`，不同仓位下到底能给账户带来多少收益。
+  - 如果该结构在扩池中仍有正期望，下一步才有资格讨论提高仓位；如果扩池不稳定，则只能继续观察，不能加仓。
+- 需要改什么？
+  - 新增 `src/wealth_lab/strong_breakout_study.py`：实现 JSONL 读取、强突破筛选、聚合统计、仓位贡献估算和 Markdown 渲染。
+  - 修改 `src/wealth_lab/cli.py`：新增 `python run.py strong-breakout-study --jsonl <training.jsonl>`。
+  - 新增 `tests/test_strong_breakout_study.py`：验证只筛选精确结构，排除其他候选和弱结构。
+  - 顺手把上一轮组合账户共享现金层修到可测试状态：`tests/test_paper_account.py` 新增组合账户共享资金测试。
+- 本轮验证结果
+  - 针对性测试：`python -m pytest tests\test_strong_breakout_study.py tests\test_paper_account.py -q` -> `5 passed`。
+  - 全量测试：`python -m pytest -q` -> `117 passed`。
+  - 空白检查：`git diff --check` 无错误，仅有 Windows 换行提示。
+  - 10 股池 v029 产物：`python run.py strong-breakout-study --jsonl runtime\training\20260708T023826Z-training.jsonl`。
+    - 报告：`runtime/studies/20260708T023826Z-strong-breakout-study.md`。
+    - 样本：`2` 笔、`2` 个股票、胜率 `100.00%`、平均收益 `27.9070%`、最差收益 `25.8904%`。
+    - 固定仓位贡献：`5%` 仓位约 `2.7907%`，`10%` 仓位约 `5.5814%`，`15%` 仓位约 `8.3721%`，`20%` 仓位约 `11.1628%`。
+  - 随机池产物一：`python run.py strong-breakout-study --jsonl runtime\training\20260708T065056Z-training.jsonl`。
+    - 报告：`runtime/studies/20260708T065056Z-strong-breakout-study.md`。
+    - 扫描 `49` 个候选结果，命中 `5` 笔、`4` 个股票、胜率 `60.00%`、平均收益 `6.5942%`、最大盈利 `21.5781%`、最大亏损 `-2.3478%`。
+    - 固定 `15%` 仓位贡献约 `4.9456%`，固定 `20%` 仓位贡献约 `6.5942%`。
+  - 随机池产物二：`python run.py strong-breakout-study --jsonl runtime\training\20260708T065159Z-training.jsonl`。
+    - 报告：`runtime/studies/20260708T065159Z-strong-breakout-study.md`。
+    - 扫描 `96` 个候选结果，命中 `8` 笔、`7` 个股票、胜率 `62.50%`、平均收益 `8.5930%`、最大盈利 `41.1765%`、最大亏损 `-6.8823%`。
+    - 固定 `15%` 仓位贡献约 `10.3116%`，固定 `20%` 仓位贡献约 `13.7488%`。
+  - 扩池产物三：`python run.py strong-breakout-study --jsonl runtime\training\20260708T081658Z-training.jsonl`。
+    - 报告：`runtime/studies/20260708T081658Z-strong-breakout-study.md`。
+    - 扫描 `32` 个候选结果，命中 `1` 笔、`1` 个股票、胜率 `0.00%`、平均收益 `-2.9067%`。
+    - 说明该结构在不同样本中的证据并不稳定，不能只看 10 股池大赢家。
+- 是否达到年收益 10.00%？
+  - 没有直接达到。这是离线结构验证，不是账户实盘模拟。
+  - 但它给出了明确方向：强突破结构在部分随机池中确实能贡献接近或超过 `10%` 的账户毛收益估算，但样本数仍少，并且另一个扩池产物为负，不能直接晋级。
+- 下一步
+  - 不能立刻把强突破仓位提高到 `15%-20%`。
+  - 下一步应在修复后的有效扩池流程上重新跑一个真实 `100/300` 非创业板池，再用 `strong-breakout-study` 验证：
+    - 命中交易是否至少 `30` 笔；
+    - 胜率是否保持在 `55%+`；
+    - 平均收益是否明显为正；
+    - 最大亏损是否可被 `1%-3%` 单笔账户风险承受；
+    - 固定 `10%-15%` 仓位下账户贡献是否稳定接近年收益 `10%`。
+
+## 动作 041 - 固定自选池共享账户回测
+
+- 遇到了什么问题？
+  - 用户希望固定当前自选池，并按更接近真实账户的方式验证：不是每只股票单独 `100000`，而是一个账户共享 `100000` 初始资金。
+  - 用户表述为“去年的 `2026-07-09` 到现在”，结合当前日期 `2026-07-09`，本轮按 `2025-07-09 -> 2026-07-09` 解释并执行。
+  - 需要回答当前主策略在这组自选股里最终收益是多少，而不是继续讨论扩池或新增条件。
+- 打算怎么做？
+  - 固定自选池：`000620`、`002031`、`601929`、`000592`、`600879`、`002255`、`002279`、`000725`、`600478`、`002369`。
+  - 使用当前主策略 `volume_price_breakout_opening_guard_probe`，通过组合模拟盘命令统一执行共享现金账户回测。
+  - 账户约束保持保守：最多 `5` 个持仓，单笔最小买入权重 `5%`，单票最大权重 `20%`。
+- 这么做有什么意义？
+  - 这一步比单票回测更接近真实账户，因为同一笔现金不能同时无限复制到每只股票。
+  - 它能直接回答：如果只用用户自选池，当前程序一年到底把 `100000` 做到了多少，而不是看单笔大涨或候选平均收益。
+  - 月度收益、成交次数和空仓月份可以暴露核心瓶颈：是策略亏损严重，还是交易太少、资金利用率太低。
+- 需要改什么？
+  - 本轮不修改主策略买卖条件。
+  - 复用组合账户层 `portfolio-paper-account`，只运行固定自选池回测并记录结果。
+  - 回测命令：`python run.py portfolio-paper-account 000620 002031 601929 000592 600879 002255 002279 000725 600478 002369 --start 2025-07-09 --end 2026-07-09 --initial-cash 100000 --max-positions 5 --min-buy-weight-pct 5 --max-position-weight-pct 20`。
+- 本轮验证结果
+  - 模拟盘报告：`runtime/paper_account/20260709T015745Z-portfolio-paper-account.md`。
+  - 主策略：`volume_price_breakout_opening_guard_probe`。
+  - 期初资金：`100000.00`。
+  - 期末权益：`102921.00`。
+  - 总收益：`2.9210%`。
+  - 最大回撤：`0.6450%`。
+  - 成交：`10` 笔成交，其中 `5` 笔买入、`5` 笔卖出；跳过订单 `0`，错误 `0`。
+  - 月度收益：`2025-10` 为 `0.3710%`，`2025-11` 为 `0.9973%`，`2025-12` 为 `1.1187%`，`2026-01` 为 `0.4390%`，`2026-04` 为 `-0.0923%`，`2026-05` 为 `0.0583%`，其余月份为 `0.0000%`。
+  - 实际交易股票：`000592`、`600879`、`601929`、`000620`；其余 `6` 只在该策略下无成交。
+  - 成交明细：
+    - `2025-10-31` 买入 `000592` `700` 股，`6.55`；`2025-11-07` 卖出，`8.51`。
+    - `2025-12-15` 买入 `600879` `300` 股，`14.60`；`2025-12-22` 卖出，`18.38`。
+    - `2026-01-13` 买入 `601929` `1500` 股，`4.25`；`2026-01-15` 卖出，`4.55`。
+    - `2026-04-16` 买入 `600879` `500` 股，`23.21`；`2026-04-17` 卖出，`23.02`。
+    - `2026-05-18` 买入 `000620` `1500` 股，`3.31`；`2026-05-20` 卖出，`3.35`。
+  - 针对性测试：`python -m pytest tests\test_paper_account.py tests\test_strong_breakout_study.py -q` -> `5 passed`。
+  - 全量测试：`python -m pytest -q` -> `117 passed`。
+  - 空白检查：`git diff --check` 无错误，仅有 Windows 换行提示。
+- 是否达到年收益 10.00%？
+  - 否。固定自选池共享账户一年总收益为 `2.9210%`，没有达到 `10.00%`。
+  - 主要问题不是最大回撤过大，而是交易覆盖不足：一年只有 `5` 次完整买卖，且大部分月份没有持仓贡献。
+  - 强势样本确实贡献明显，但当前风控仓位较小，单票大涨没有完全转化为账户级别的高收益。
+- 下一步
+  - 不应马上改 `opening_guard`，因为这次主策略本身能控制回撤，问题更像资金利用率和高质量机会覆盖不足。
+  - 下一轮应先做离线仓位测算：只对已证明更强的 `breakout_start / effort_vs_result_breakout / volume_node:volume_breakout` 结构，比较 `5%/10%/15%` 分档仓位对账户收益和最大回撤的影响。
+  - 同时补充自选池错过机会报告：哪些股票后续 `3-5` 天明显上涨但没有买，是因为没有识别为 `volume_breakout`、被开盘守门拦截，还是支撑距离/资金条件不合格。
+
+## 动作 042 - 高风险 20% 固定仓位与交易次数扩展实验
+
+- 遇到了什么问题？
+  - 上一轮固定自选池共享账户收益为 `2.9210%`，主要瓶颈是仓位太小和交易次数太少。
+  - 用户明确希望提高交易次数，并把尝试仓位调整到 `20%`，接受更高风险。
+  - 代码里组合账户虽然已有 `max_position_weight=20%`，但实际买入会继承单票风险仓位，很多交易只有约 `3%-12%`，没有真正体现固定 `20%` 高风险试错。
+- 打算怎么做？
+  - 不把 20% 写死进主策略；只在组合账户回测参数里用 `--min-buy-weight-pct 20 --max-position-weight-pct 20` 固定每次买入约 `20%`。
+  - 保留主策略 `volume_price_breakout_opening_guard_probe` 作为高风险基准。
+  - 给 `portfolio-paper-account` 增加候选选择入口，再运行已有二段式观察池候选 `volume_price_pre_breakout_watchlist_opening_guard_probe`，用于验证交易次数能否提高。
+- 这么做有什么意义？
+  - 这一步把“仓位提高到 20%”和“增加交易次数”分开验证，避免把收益提高误判为策略变好。
+  - 如果 20% 固定仓位能达标但交易次数不变，说明收益来自仓位放大，不是机会识别能力提升。
+  - 如果 watchlist 增加交易次数但收益下降，说明它扩大的是噪音交易，而不是高质量交易。
+- 需要改什么？
+  - 修改 `src/wealth_lab/paper_account.py`：新增 `portfolio_paper_account_candidate()`，允许组合模拟盘选择已存在的训练候选。
+  - 修改 `src/wealth_lab/cli.py`：给 `portfolio-paper-account` 新增 `--candidate`，支持主策略和二段式观察池候选。
+  - 修改 `tests/test_paper_account.py`：新增固定 `20%` 买入权重测试和 watchlist 候选选择测试。
+- 本轮验证结果
+  - 针对性测试：`python -m pytest tests\test_paper_account.py -q` -> `6 passed`。
+  - 相关测试：`python -m pytest tests\test_paper_account.py tests\test_training.py tests\test_volume_probe.py -q` -> `64 passed`。
+  - 全量测试：`python -m pytest -q` -> `119 passed`。
+  - 空白检查：`git diff --check` 无错误，仅有 Windows 换行提示。
+  - 主策略 20% 固定仓位命令：`python run.py portfolio-paper-account 000620 002031 601929 000592 600879 002255 002279 000725 600478 002369 --start 2025-07-09 --end 2026-07-09 --initial-cash 100000 --max-positions 5 --min-buy-weight-pct 20 --max-position-weight-pct 20 --candidate volume_price_breakout_opening_guard_probe`。
+  - 主策略 20% 报告：`runtime/paper_account/20260709T020805Z-portfolio-paper-account.md`。
+    - 期初 `100000.00`，期末 `112833.00`，总收益 `12.8330%`，最大回撤 `2.5957%`。
+    - 成交 `10` 笔，闭合交易 `5` 笔，`4` 盈 `1` 亏。
+    - 逐笔：`000592 +29.9237%`、`600879 +25.8904%`、`601929 +7.0588%`、`600879 -0.8186%`、`000620 +1.2085%`。
+  - 二段式观察池 20% 固定仓位命令：`python run.py portfolio-paper-account 000620 002031 601929 000592 600879 002255 002279 000725 600478 002369 --start 2025-07-09 --end 2026-07-09 --initial-cash 100000 --max-positions 5 --min-buy-weight-pct 20 --max-position-weight-pct 20 --candidate volume_price_pre_breakout_watchlist_opening_guard_probe`。
+  - 二段式观察池 20% 报告：`runtime/paper_account/20260709T020834Z-portfolio-paper-account.md`。
+    - 期初 `100000.00`，期末 `108372.00`，总收益 `8.3720%`，最大回撤 `3.2585%`。
+    - 成交 `20` 笔，闭合交易 `10` 笔，`3` 盈 `7` 亏。
+    - 新增交易主要来自 `002369`、`002255`、`002031`、`600879`、`000620` 的观察池试错，但多数为亏损。
+- 是否达到年收益 10.00%？
+  - 主策略 20% 固定仓位达到：`12.8330%`。
+  - 二段式观察池 20% 未达到：`8.3720%`。
+  - 但主策略 20% 只有 `5` 笔闭合交易，仍是小样本；这证明当前程序具备“高风险仓位放大后达标”的回测能力，不证明它已经具备稳定可实盘的高风险交易系统能力。
+- 下一步
+  - 当前更适合作为高风险基准的是：主策略 `volume_price_breakout_opening_guard_probe` + 固定 `20%` 仓位，而不是二段式观察池。
+  - 不应简单追求更多交易次数；本轮证据显示，交易次数从 `5` 笔翻到 `10` 笔后，胜率从 `80%` 降到 `30%`，收益下降且回撤上升。
+  - 下一轮应只针对 watchlist 新增亏损样本做拦截实验，优先拦截 `win_rate_below_min`、`avg_return_below_min` 仍被放行的观察池交易；目标是在不牺牲主策略强样本的前提下，把交易数提高到 `6-8` 笔，而不是盲目提高到 `10+` 笔。
+
+## 动作 043 - 取消组合执行层观察池并默认高风险 20% 仓位
+
+- 遇到了什么问题？
+  - 用户接受收益集中在少数月份，而不是要求每个月都稳定盈利。
+  - 动作 042 证明二段式观察池虽然把闭合交易从 `5` 笔提高到 `10` 笔，但胜率从 `80%` 降到 `30%`，总收益从主策略 20% 的 `12.8330%` 降到 `8.3720%`。
+  - 因此观察池在当前自选池里不是有效谨慎，而是把低质量试错放进了执行层。
+- 打算怎么做？
+  - 取消组合模拟盘执行层的观察池候选入口，不再允许 `portfolio-paper-account` 通过 `--candidate` 切到二段式观察池。
+  - 保留历史训练研究里的 watchlist 代码和 `train-replay --include-watchlist-probe`，因为它仍可用于研究和复盘，但不作为当前组合执行路径。
+  - 把组合账户默认买入权重调整为 `20%`：`--min-buy-weight-pct` 默认从 `5.0` 改为 `20.0`，`--max-position-weight-pct` 保持 `20.0`。
+- 这么做有什么意义？
+  - 执行层回到最清晰的高风险基准：直接突破主策略 + 固定 20% 仓位。
+  - 这避免用户每次运行默认组合回测时不小心选择观察池，把已经证伪的谨慎路径重新引入账户结果。
+  - 保留研究入口可以以后继续分析错过机会，但研究结论必须重新证明有效后才进入执行层。
+- 需要改什么？
+  - 修改 `src/wealth_lab/cli.py`：删除 `portfolio-paper-account --candidate`，删除组合执行层候选列表，默认 `--min-buy-weight-pct=20.0`。
+  - 修改 `src/wealth_lab/paper_account.py`：删除仅服务于组合候选选择的 `portfolio_paper_account_candidate()`。
+  - 修改 `tests/test_paper_account.py`：删除观察池候选选择测试，保留 20% 固定仓位测试。
+- 本轮验证结果
+  - 针对性测试：`python -m pytest tests\test_paper_account.py -q` -> `5 passed`。
+  - 全量测试：`python -m pytest -q` -> `118 passed`。
+  - 空白检查：`git diff --check` 无错误，仅有 Windows 换行提示。
+  - 代码检索：`src/wealth_lab/cli.py`、`src/wealth_lab/paper_account.py`、`tests/test_paper_account.py` 中不再存在组合账户观察池候选入口。
+  - 默认高风险组合回测命令：`python run.py portfolio-paper-account 000620 002031 601929 000592 600879 002255 002279 000725 600478 002369 --start 2025-07-09 --end 2026-07-09 --initial-cash 100000`。
+  - 默认高风险组合回测报告：`runtime/paper_account/20260709T021610Z-portfolio-paper-account.md`。
+    - 策略：`volume_price_breakout_opening_guard_probe`。
+    - 规则：`min_buy_weight=20.00%`，`max_position_weight=20.00%`。
+    - 期初 `100000.00`，期末 `112833.00`，总收益 `12.8330%`，最大回撤 `2.5957%`。
+    - 成交 `10` 笔，闭合交易 `5` 笔，`4` 盈 `1` 亏。
+- 是否达到年收益 10.00%？
+  - 是。当前默认组合模拟盘执行路径在该固定自选池、该一年区间内为 `12.8330%`。
+  - 但它仍然只有 `5` 笔闭合交易，样本数不足以证明长期稳定；本结论只代表当前固定自选池、当前回测区间和当前高风险仓位设置。
+- 下一步
+  - 当前不要再恢复观察池执行入口。
+  - 下一步如果继续提升，应围绕“直接突破主策略”的错过机会做小范围扩展，而不是回到观察后确认。
+  - 重点看未成交的大涨前一天是否已经出现 `volume_breakout` 的近似结构；如果没有，不追求为了增加交易而放开普通观察节点。
+
+## 动作 044 - 大池适应失败诊断：单一放量突破模型的泛化问题
+
+- 遇到了什么问题？
+  - 用户指出当前程序在更大的股票池里无法适应，怀疑原因是数据模型太过单一。
+  - 最新大池训练产物 `runtime/training/20260709T031838Z-summary.md` 显示，当前主策略 `volume_price_breakout_opening_guard_probe` 在 `444` 个有效股票结果中交易了 `85` 只股票、闭合交易 `129` 笔，但胜率只有 `32.56%`，平均单笔收益为 `-1.3361%`，最佳 `+15.3346%`，最差 `-19.7324%`。
+  - 这说明大池失败不是“没有交易”，而是规则在更大的样本中买到了大量假突破；小池 `20%` 固定仓位的 `12.8330%` 收益主要来自少数强样本，不能直接证明通用能力。
+  - 错过机会报告显示，大涨前未买的主要原因不是 `opening_guard_cancel`，而是 `ordinary_non_signal=5430`、`not_volume_breakout=2174`、`history_gate_failed=473`；`opening_guard_cancel` 只有 `30` 次。
+  - 资金数据覆盖也不稳定：大池平均资金流覆盖约 `44.89%`，`37` 只股票没有资金流信号；同时训练文件中 provider 错误较多，说明扩池数据层仍需要治理。
+
+- 打算怎么做？
+  - 暂时不修改 `opening_guard`，也不恢复观察池执行；当前证据显示主要问题不是开盘守门过严。
+  - 先把大池失败拆成诊断报告：按交易结果、行为阶段、资金偏向、股票代码板块、退出原因、错过机会归因分组，确认哪些组合是正期望，哪些组合是假突破高发。
+  - 新增一个“股票画像/环境画像”层作为执行前上下文，而不是新增买点：
+    - 市场环境：指数趋势、全市场涨跌家数、连板/情绪周期。
+    - 板块热度：所属行业或主题是否处在强势扩散阶段。
+    - 个股画像：流动性、价格区间、波动率、涨跌停频率、历史假突破率。
+    - 量价阶段：吸筹、洗盘、启动、加速、派发不能只靠 `volume_breakout` 一个节点判断。
+    - 资金质量：主力流入要区分启动资金、承接资金、诱多资金和撤退资金。
+  - 在这些画像层没有证明有效前，大池模式只作为扫描器和研究器，不直接宣称可配置资金。
+
+- 这么做有什么意义？
+  - 当前主策略在固定自选池里有效，是因为池子本身已经带有人工筛选和题材偏好；扩到随机大池后，股票性格、题材强弱、流动性、波动结构全部变复杂，同一条放量突破规则会遇到更多“看起来像突破、实际是诱多或冲高回落”的样本。
+  - 继续调 `+3%` 开盘、支撑距离、最小历史样本这类参数，只会在局部样本上过拟合；真正需要先回答的是：什么类型的股票、什么市场环境、什么阶段里的突破才值得 20% 仓位试错。
+  - 把大池执行改为“先画像、再交易”，可以让程序从单一信号工程升级为分层交易系统：先判断这只票是否属于可交易生态，再判断今天是不是买点。
+
+- 需要改什么？
+  - 新增大池失败诊断报告入口，例如 `large-pool-diagnosis`，读取训练 JSONL/交易台账并输出：
+    - 胜负笔数、胜率、平均收益、最大亏损。
+    - 按 `verdict`、`behavior_phase`、`fund_flow_bias`、代码前缀、月份、退出原因分组。
+    - 错过大涨按 `ordinary_non_signal / not_volume_breakout / history_gate_failed / opening_guard_cancel` 分组。
+    - 资金流覆盖不足和 provider 失败统计。
+  - 修正训练错误记录的 JSONL 可解析性，避免 provider 错误消息截断导致后续诊断脚本解析失败。
+  - 后续再新增画像层字段，不直接改买入条件；只有当画像层能让大池平均单笔收益从负转正、胜率明显提高，并且交易数仍满足 `30+` 闭合交易，才允许进入执行层。
+
+- 本轮验证结果
+  - 已复核 `runtime/training/20260709T031838Z-summary.md`、`runtime/training/20260709T031838Z-trade-ledger.md`、`runtime/training/20260709T031838Z-missed_breakout_opportunity_report.md`。
+  - 大池主策略聚合：`129` 笔闭合交易，`42` 盈利、`87` 亏损，胜率 `32.56%`，平均收益 `-1.3361%`。
+  - 按交易 verdict 粗分：`thesis_confirmed` 为正，`24` 笔平均约 `+5.67%`；`thesis_failed` 为负，`38` 笔平均约 `-5.14%`；`warnings_confirmed_exit` 为负，`40` 笔平均约 `-3.19%`。
+  - 按行为阶段粗分，`markdown_or_outflow`、`distribution_or_failed_breakout`、`no_fund_flow_signal` 都是负期望高发区，说明仅凭当天突破节点不够。
+  - 错过机会主因是识别层过窄：大量后续大涨发生在 `normal / dry_up_base / quiet_consolidation / shrink_pullback` 或历史门槛不足的状态，而不是被开盘 guard 大量拦截。
+
+- 是否达到目标？
+  - 没有。大池回放不仅没有达到年收益 `10%`，而且主策略平均单笔收益为负，不能作为大池资金配置依据。
+  - 固定自选池 `20%` 仓位的达标结果仍保留为高风险小池基准，但不能外推到随机大池。
+
+- 下一步
+  - 第一优先级：补一个可复用的大池失败诊断报告，把失败原因从人工阅读报告变成程序固定输出。
+  - 第二优先级：修正训练错误 JSONL 可解析性和扩池数据质量，保证 `100/300` 池验证真实有效。
+  - 第三优先级：在不改主策略的前提下建立“股票画像/环境画像”字段，先做分组统计，不直接买卖。
+  - 第四优先级：只有当某个画像组合在大池中满足 `30+` 闭合交易、正期望、胜率明显高于当前 `32.56%`，再考虑把它接入 `volume_price_breakout_opening_guard_probe` 的执行前过滤层。

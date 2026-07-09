@@ -1,3 +1,4 @@
+import csv
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -14,15 +15,25 @@ from wealth_lab.training import (
     FilterAttribution,
     LossAttribution,
     MissedOpportunity,
+    PreBreakoutObservation,
+    TradeDetail,
     TrainingRun,
     default_training_candidates,
     evaluate_training_candidates,
+    render_large_pool_diagnosis,
     render_expansion_validation_summary,
     render_missed_breakout_opportunity_report,
     render_training_summary,
+    run_replay_training,
+    training_candidates_with_fast_failure_probe,
+    training_candidates_with_main_force_profile_probe,
+    training_candidates_with_watchlist_probe,
     _evidence_score,
     _missed_big_move_stats,
+    _pre_breakout_watch_stats,
     _promotion_decision,
+    write_large_pool_diagnosis,
+    write_training_artifacts,
 )
 
 
@@ -49,6 +60,41 @@ def test_evaluate_training_candidates_returns_comparable_results() -> None:
     assert all(item.trading_mode for item in results)
     assert all(item.behavior_phase for item in results)
     assert all(item.fund_flow_bias for item in results)
+
+
+def test_evaluate_training_candidates_allows_missing_fund_flow_data() -> None:
+    bars, _ = _dataset()
+
+    [result] = evaluate_training_candidates(
+        run_id="missing-flow-run",
+        symbol="000001",
+        bars=bars,
+        fund_flows=[],
+        initial_cash=100000,
+        target_annual_return=0.10,
+        candidates=default_training_candidates(),
+    )
+
+    assert result.fund_flows_count == 0
+    assert result.missing_fund_flow_dates == len(bars)
+    assert result.trading_mode == "WAIT_DATA"
+    assert result.behavior_phase == "no_fund_flow_signal"
+
+
+def test_run_replay_training_rejects_non_positive_workers(tmp_path: Path) -> None:
+    try:
+        run_replay_training(
+            symbols=["000001"],
+            days=30,
+            initial_cash=100000,
+            target_annual_return=0.10,
+            output_dir=tmp_path,
+            max_workers=0,
+        )
+    except ValueError as exc:
+        assert "max_workers" in str(exc)
+    else:
+        raise AssertionError("expected max_workers validation")
 
 
 def test_render_training_summary_lists_candidate_hypotheses() -> None:
@@ -87,11 +133,183 @@ def test_render_training_summary_lists_candidate_hypotheses() -> None:
     assert "Knowledge Hypothesis Diagnostics" in summary
     assert "Latest behavior state by candidate" in summary
     assert "Capital Utilization" in summary
+    assert "Execution Target Bands" in summary
     assert "Filter Attribution" in summary
     assert "Missed Big Move Diagnostics" in summary
+    assert "Data Coverage" in summary
+    assert "Pre-Breakout Observation Layer" in summary
     assert "core" in summary
     assert "sample" in summary
     assert "simulated research only" in summary
+
+
+def test_training_jsonl_persists_parseable_trade_details(tmp_path: Path) -> None:
+    training_run = TrainingRun(
+        run_id="jsonl-run",
+        created_at="2026-07-09T00:00:00+00:00",
+        symbols=("000001",),
+        days=120,
+        initial_cash=100000,
+        target_annual_return=0.10,
+        candidates=("volume_price_breakout_opening_guard_probe",),
+        results=(
+            _candidate_result(
+                candidate="volume_price_breakout_opening_guard_probe",
+                tier="core",
+                symbol="000001",
+                trade_details=(
+                    TradeDetail(
+                        trade_id="jsonl-run-000001-001",
+                        symbol="000001",
+                        entry_date="2026-01-02",
+                        exit_date="2026-01-05",
+                        quantity=1000,
+                        entry_price=10.0,
+                        exit_price=10.5,
+                        net_pnl=500.0,
+                        return_pct=5.0,
+                        holding_days=3,
+                        entry_reason="entry",
+                        exit_reason="exit",
+                    ),
+                ),
+            ),
+        ),
+        errors=(),
+        jsonl_path=tmp_path / "training.jsonl",
+        summary_path=tmp_path / "summary.md",
+    )
+
+    write_training_artifacts(training_run)
+
+    import json
+
+    rows = [json.loads(line) for line in training_run.jsonl_path.read_text().splitlines()]
+    result = next(row for row in rows if row["kind"] == "candidate_result")
+    assert result["trade_details"][0]["trade_id"] == "jsonl-run-000001-001"
+
+    csv_path = tmp_path / "training-trade-details.csv"
+    markdown_path = tmp_path / "training-trade-details.md"
+    csv_text = csv_path.read_text(encoding="utf-8-sig")
+    markdown_text = markdown_path.read_text(encoding="utf-8")
+
+    assert csv_path.exists()
+    assert markdown_path.exists()
+    assert "trade_id,run_id,candidate,tier,symbol,initial_cash,buy_date,sell_date" in csv_text
+    assert "profit,loss,net_pnl" in csv_text
+    assert "# Trade Details" in markdown_text
+    assert "jsonl-run-000001-001" in markdown_text
+    [trade_row] = list(csv.DictReader(csv_text.splitlines()))
+    assert trade_row["trade_id"] == "jsonl-run-000001-001"
+    assert trade_row["run_id"] == "jsonl-run"
+    assert trade_row["candidate"] == "volume_price_breakout_opening_guard_probe"
+    assert trade_row["tier"] == "core"
+    assert trade_row["symbol"] == "000001"
+    assert trade_row["initial_cash"] == "100000"
+    assert trade_row["buy_date"] == "2026-01-02"
+    assert trade_row["sell_date"] == "2026-01-05"
+    assert trade_row["profit"] == "500.0"
+    assert trade_row["loss"] == "0.0"
+    assert trade_row["net_pnl"] == "500.0"
+
+
+def test_large_pool_diagnosis_reports_profiles_and_trade_ledger(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "training.jsonl"
+    training_run = TrainingRun(
+        run_id="diagnosis-run",
+        created_at="2026-07-09T00:00:00+00:00",
+        symbols=("000001",),
+        days=120,
+        initial_cash=100000,
+        target_annual_return=0.10,
+        candidates=("volume_price_breakout_opening_guard_probe",),
+        results=(
+            _candidate_result(
+                candidate="volume_price_breakout_opening_guard_probe",
+                tier="core",
+                symbol="000001",
+                trade_details=(
+                    TradeDetail(
+                        trade_id="diagnosis-run-000001-001",
+                        symbol="000001",
+                        entry_date="2026-01-02",
+                        exit_date="2026-01-05",
+                        quantity=1000,
+                        entry_price=10.0,
+                        exit_price=9.5,
+                        net_pnl=-500.0,
+                        return_pct=-5.0,
+                        holding_days=3,
+                        entry_reason="entry",
+                        exit_reason="stop",
+                    ),
+                ),
+            ),
+        ),
+        errors=(),
+        jsonl_path=jsonl_path,
+        summary_path=tmp_path / "summary.md",
+    )
+    write_training_artifacts(training_run)
+
+    report = render_large_pool_diagnosis(jsonl_path=jsonl_path)
+    output_path = write_large_pool_diagnosis(jsonl_path=jsonl_path)
+    csv_path = tmp_path / "training-trade-details.csv"
+    markdown_path = tmp_path / "training-trade-details.md"
+
+    assert "Large Pool Diagnosis diagnosis-run" in report
+    assert "initial_cash: 100000.00" in report
+    assert "Candidate Summary" in report
+    assert "trade_details_csv:" in report
+    assert "Phase / Fund State / Board" in report
+    assert "OBSERVE: sample < 30" in report
+    assert "Trade Ledger" in report
+    assert "diagnosis-run-000001-001" in report
+    assert output_path.exists()
+    assert csv_path.exists()
+    assert markdown_path.exists()
+    assert "diagnosis-run-000001-001" in csv_path.read_text(encoding="utf-8-sig")
+    assert "loss" in csv_path.read_text(encoding="utf-8-sig")
+    assert "diagnosis-run-000001-001" in markdown_path.read_text(encoding="utf-8")
+
+
+def test_large_pool_diagnosis_reads_legacy_trade_ledger_csv(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "legacy-run-training.jsonl"
+    training_run = TrainingRun(
+        run_id="legacy-run",
+        created_at="2026-07-09T00:00:00+00:00",
+        symbols=("000001",),
+        days=120,
+        initial_cash=100000,
+        target_annual_return=0.10,
+        candidates=("volume_price_breakout_opening_guard_probe",),
+        results=(
+            _candidate_result(
+                candidate="volume_price_breakout_opening_guard_probe",
+                tier="core",
+                symbol="000001",
+            ),
+        ),
+        errors=(),
+        jsonl_path=jsonl_path,
+        summary_path=tmp_path / "summary.md",
+    )
+    write_training_artifacts(training_run)
+    (tmp_path / "legacy-run-trade-ledger.csv").write_text(
+        "\n".join(
+            (
+                "trade_id,run_id,candidate,tier,symbol,initial_cash,signal_date,buy_date,sell_date,holding_days,return_pct,result,profit_loss_amount,entry_reason,exit_reason",
+                "legacy-run-000001-001,legacy-run,volume_price_breakout_opening_guard_probe,core,000001,100000,2026-01-01,2026-01-02,2026-01-05,3,4.5,profit,not_persisted,entry,exit",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    report = render_large_pool_diagnosis(jsonl_path=jsonl_path)
+
+    assert "- all: trades=1 wins=1 losses=0" in report
+    assert "legacy-run-000001-001" in report
+    assert "2026-01-02" in report
 
 
 def test_promotion_decision_keeps_small_samples_in_observe() -> None:
@@ -458,6 +676,29 @@ def test_render_training_summary_lists_capital_utilization_and_filters() -> None
                         volume_probe_passed=True,
                     ),
                 ),
+                pre_breakout_watch_count=2,
+                pre_breakout_confirmed_count=1,
+                pre_breakout_handoff_count=1,
+                pre_breakout_observations=(
+                    PreBreakoutObservation(
+                        symbol="002031",
+                        watch_date="2026-01-01",
+                        watch_node="quiet_consolidation",
+                        close=9.8,
+                        next_1d_close_return_pct=1.5,
+                        next_3d_close_return_pct=8.0,
+                        next_5d_close_return_pct=12.0,
+                        max_forward_return_pct=12.0,
+                        max_forward_date="2026-01-05",
+                        max_forward_drawdown_pct=-1.0,
+                        confirmation_date="2026-01-03",
+                        stage2_action="handoff_to_opening_guard",
+                        confirmation_reason="volume_price_trial_entry: node=volume_breakout",
+                        price_stood=True,
+                        volume_expanded=True,
+                        main_flow_state="not_weak",
+                    ),
+                ),
                 trade_stories=(
                     _trade_story("002031", "2026-01-02", "2026-01-05", 10.0),
                     _trade_story("002031", "2026-02-02", "2026-02-05", 5.0),
@@ -498,6 +739,9 @@ def test_render_training_summary_lists_capital_utilization_and_filters() -> None
         "volume_price_breakout_opening_guard_probe | experimental | 002031 | 2026-01-02 | 10.00 | 4.00% | 12.00% | 9.00% | 14.00% | -2.00% | 2026-01-05 | opening_guard_cancel | volume_breakout | breakout_opening_gap_too_high"
         in summary
     )
+    assert "Pre-Breakout Observation Layer" in summary
+    assert "quiet_consolidation" in summary
+    assert "handoff_to_opening_guard" in summary
     assert "opening_guard_cancel" in summary
 
     missed_report = render_missed_breakout_opportunity_report(training_run)
@@ -505,6 +749,7 @@ def test_render_training_summary_lists_capital_utilization_and_filters() -> None
     assert "Missed Breakout Opportunity Report" in missed_report
     assert "max_drawdown" in missed_report
     assert "blocked_next_open" in missed_report
+    assert "Pre-Breakout Watchlist Candidates" in missed_report
 
     expansion_summary = render_expansion_validation_summary((training_run,))
 
@@ -582,6 +827,87 @@ def test_missed_big_move_counts_opening_guard_cancel_as_not_bought() -> None:
     assert "breakout_opening_gap_too_high" in opportunity.detail_reason
 
 
+def test_pre_breakout_watch_stats_marks_observation_then_handoff() -> None:
+    start = date(2026, 1, 1)
+    bars = [
+        _bar("000001", start + timedelta(days=index), close, volume=volume)
+        for index, (close, volume) in enumerate(
+            (
+                (10.0, 1_000_000),
+                (10.3, 1_000_000),
+                (10.9, 2_000_000),
+                (11.2, 1_800_000),
+                (11.4, 1_400_000),
+                (11.0, 1_000_000),
+            )
+        )
+    ]
+    replay = ReplayResult(
+        symbol="000001",
+        name="test",
+        bars_count=len(bars),
+        fund_flows_count=1,
+        first_bar_date=bars[0].trade_date,
+        last_bar_date=bars[-1].trade_date,
+        signals=[],
+        decisions=[
+            ReplayDecision(
+                signal_date=bars[0].trade_date,
+                symbol="000001",
+                fund_signal="volume_price",
+                pattern_tags=("quiet_consolidation",),
+                side=None,
+                reason="volume_price_trial_blocked: node=quiet_consolidation",
+                observation_type="volume_price",
+                volume_node="quiet_consolidation",
+                volume_probe_passed=False,
+            ),
+            ReplayDecision(
+                signal_date=bars[2].trade_date,
+                symbol="000001",
+                fund_signal="volume_price",
+                pattern_tags=("volume_breakout",),
+                side="BUY",
+                reason="volume_price_trial_entry: node=volume_breakout",
+                observation_type="volume_price",
+                volume_node="volume_breakout",
+                volume_probe_passed=True,
+            ),
+        ],
+        fills=[],
+        equity_curve=[
+            PortfolioSnapshot(
+                trade_date=bar.trade_date,
+                cash=100000,
+                market_value=0,
+                total_value=100000,
+            )
+            for bar in bars
+        ],
+        missing_fund_flow_dates=[],
+        skipped_orders=[],
+        initial_cash=100000,
+        final_value=100000,
+        total_return=0,
+        max_drawdown=0,
+        bars=bars,
+        fund_flows=[_flow(bars[2].trade_date, 1_000_000, 0, 0, 1.0, 3.0)],
+    )
+
+    stats = _pre_breakout_watch_stats(replay, include_details=True)
+
+    assert stats["watch_count"] == 1
+    assert stats["confirmed_count"] == 1
+    assert stats["handoff_count"] == 1
+    [observation] = stats["observations"]
+    assert observation.watch_node == "quiet_consolidation"
+    assert observation.confirmation_date == bars[2].trade_date.isoformat()
+    assert observation.stage2_action == "handoff_to_opening_guard"
+    assert observation.price_stood is True
+    assert observation.volume_expanded is True
+    assert observation.main_flow_state == "not_weak"
+
+
 def test_evidence_score_caps_no_closed_trade_runs() -> None:
     score = _evidence_score(
         sample_quality="no_closed_trades",
@@ -636,6 +962,90 @@ def test_default_candidates_only_keep_opening_guard_probe() -> None:
     assert breakout_opening_guard_config.enable_volume_price_risk_sizing
     assert breakout_opening_guard_config.enable_volume_price_intent_filter
     assert breakout_opening_guard_config.volume_price_block_non_breakout_markdown
+
+
+def test_watchlist_candidates_keep_core_and_add_two_stage_experiment() -> None:
+    candidates = training_candidates_with_watchlist_probe()
+    by_name = {item.name: item for item in candidates}
+
+    assert tuple(by_name) == (
+        "volume_price_breakout_opening_guard_probe",
+        "volume_price_pre_breakout_watchlist_opening_guard_probe",
+    )
+    core = by_name["volume_price_breakout_opening_guard_probe"]
+    watchlist = by_name["volume_price_pre_breakout_watchlist_opening_guard_probe"]
+
+    assert core.tier == "core"
+    assert watchlist.tier == "experimental"
+    assert watchlist.config.enable_volume_price_pre_breakout_watchlist_entry
+    assert watchlist.config.volume_price_pre_breakout_observation_weight == 0.05
+    assert watchlist.config.volume_price_pre_breakout_strong_weight == 0.10
+    assert watchlist.config.volume_price_pre_breakout_continuous_weight == 0.15
+    assert watchlist.config.volume_price_risk_sizing_respects_decision_cap
+    assert watchlist.config.enable_volume_price_follow_through_exit
+    assert watchlist.config.volume_price_follow_through_no_confirm_bars == 2
+    assert watchlist.config.volume_price_breakout_max_opening_gap_pct == 3.0
+
+
+def test_main_force_profile_candidates_keep_core_and_add_research_filter() -> None:
+    candidates = training_candidates_with_main_force_profile_probe()
+    by_name = {item.name: item for item in candidates}
+
+    assert tuple(by_name) == (
+        "volume_price_breakout_opening_guard_probe",
+        "volume_price_main_force_profile_filter_probe",
+        "volume_price_fast_failure_cut_probe",
+        "volume_price_weak_main_force_fast_cut_probe",
+    )
+    core = by_name["volume_price_breakout_opening_guard_probe"]
+    profile_filter = by_name["volume_price_main_force_profile_filter_probe"]
+    fast_cut = by_name["volume_price_fast_failure_cut_probe"]
+    weak_main_force_fast_cut = by_name[
+        "volume_price_weak_main_force_fast_cut_probe"
+    ]
+
+    assert core.tier == "core"
+    assert profile_filter.tier == "experimental"
+    assert profile_filter.config.enable_volume_price_main_force_profile_filter
+    assert profile_filter.config.volume_price_main_force_allowed_stages == (
+        "accumulation_watch",
+        "markup_confirmed",
+    )
+    assert profile_filter.config.volume_price_follow_through_no_confirm_bars == 2
+    assert profile_filter.config.volume_price_follow_through_exit_on_negative_main_flow
+    assert fast_cut.tier == "experimental"
+    assert fast_cut.config.stop_loss_pct == 0.04
+    assert fast_cut.config.volume_price_follow_through_no_confirm_bars == 1
+    assert fast_cut.config.volume_price_follow_through_exit_on_negative_main_flow
+    assert weak_main_force_fast_cut.tier == "experimental"
+    assert weak_main_force_fast_cut.config.enable_volume_price_weak_main_force_block
+    assert weak_main_force_fast_cut.config.stop_loss_pct == 0.04
+    assert (
+        weak_main_force_fast_cut.config.volume_price_weak_main_force_block_stages
+        == ("distribution_risk", "failed_breakout")
+    )
+    assert (
+        weak_main_force_fast_cut.config.volume_price_follow_through_no_confirm_bars
+        == 1
+    )
+
+
+def test_fast_failure_candidates_skip_strict_main_force_filter() -> None:
+    candidates = training_candidates_with_fast_failure_probe()
+    by_name = {item.name: item for item in candidates}
+
+    assert tuple(by_name) == (
+        "volume_price_breakout_opening_guard_probe",
+        "volume_price_fast_failure_cut_probe",
+        "volume_price_weak_main_force_fast_cut_probe",
+    )
+    assert "volume_price_main_force_profile_filter_probe" not in by_name
+    assert by_name["volume_price_breakout_opening_guard_probe"].tier == "core"
+    assert by_name["volume_price_fast_failure_cut_probe"].tier == "experimental"
+    assert (
+        by_name["volume_price_weak_main_force_fast_cut_probe"].tier
+        == "experimental"
+    )
 
 
 def _promotion_aggregate(
@@ -728,6 +1138,11 @@ def _candidate_result(
     top_missed_big_move_reason: str = "-",
     missed_opportunity_attributions: tuple[FilterAttribution, ...] = (),
     missed_opportunities: tuple[MissedOpportunity, ...] = (),
+    pre_breakout_watch_count: int = 0,
+    pre_breakout_confirmed_count: int = 0,
+    pre_breakout_handoff_count: int = 0,
+    pre_breakout_observations: tuple[PreBreakoutObservation, ...] = (),
+    trade_details: tuple[TradeDetail, ...] = (),
 ) -> CandidateResult:
     return CandidateResult(
         run_id="loss-summary",
@@ -773,7 +1188,12 @@ def _candidate_result(
         top_missed_big_move_reason=top_missed_big_move_reason,
         missed_opportunity_attributions=missed_opportunity_attributions,
         missed_opportunities=missed_opportunities,
+        pre_breakout_watch_count=pre_breakout_watch_count,
+        pre_breakout_confirmed_count=pre_breakout_confirmed_count,
+        pre_breakout_handoff_count=pre_breakout_handoff_count,
+        pre_breakout_observations=pre_breakout_observations,
         loss_attributions=loss_attributions,
+        trade_details=trade_details,
         trade_stories=trade_stories,
         position_action_reviews=position_action_reviews,
         knowledge_hypothesis_reviews=knowledge_hypothesis_reviews,

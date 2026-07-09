@@ -30,6 +30,7 @@ class StockPoolSelection:
     requested_count: int
     eligible_count: int
     exclude_chinext: bool
+    max_price: float | None = None
     universe_source: str = "live"
     universe_cache_path: str | None = None
 
@@ -43,8 +44,10 @@ class NestedStockPoolSelection:
     requested_sizes: tuple[int, ...]
     eligible_count: int
     exclude_chinext: bool
+    max_price: float | None = None
     universe_source: str = "live"
     universe_cache_path: str | None = None
+    candidate_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,18 +64,25 @@ def select_random_a_share_pool(
     count: int,
     seed: int,
     exclude_chinext: bool = True,
+    max_price: float | None = None,
     provider: QuoteUniverseProvider | None = None,
     cache_dir: Path | None = None,
+    prefer_cache: bool = False,
 ) -> StockPoolSelection:
     """Select a reproducible random A-share pool from current spot quotes."""
 
     if count <= 0:
         raise ValueError("count must be positive")
     quote_provider = provider or EfinanceProvider()
-    universe = _load_quote_universe(quote_provider, cache_dir=cache_dir)
+    universe = _load_quote_universe(
+        quote_provider,
+        cache_dir=cache_dir,
+        prefer_cache=prefer_cache,
+    )
     eligible = _eligible_symbols_from_quotes(
         list(universe.quotes),
         exclude_chinext=exclude_chinext,
+        max_price=max_price,
     )
     if count > len(eligible):
         raise ValueError(
@@ -86,6 +96,7 @@ def select_random_a_share_pool(
         requested_count=count,
         eligible_count=len(eligible),
         exclude_chinext=exclude_chinext,
+        max_price=max_price,
         universe_source=universe.source,
         universe_cache_path=str(universe.cache_path) if universe.cache_path else None,
     )
@@ -96,8 +107,11 @@ def select_nested_random_a_share_pools(
     pool_sizes: Iterable[int],
     seed: int,
     exclude_chinext: bool = True,
+    max_price: float | None = None,
     provider: QuoteUniverseProvider | None = None,
     cache_dir: Path | None = None,
+    candidate_count: int | None = None,
+    prefer_cache: bool = False,
 ) -> NestedStockPoolSelection:
     """Select nested reproducible A-share pools for expansion validation."""
 
@@ -108,19 +122,29 @@ def select_nested_random_a_share_pools(
         raise ValueError("pool sizes must be positive")
 
     quote_provider = provider or EfinanceProvider()
-    universe = _load_quote_universe(quote_provider, cache_dir=cache_dir)
+    universe = _load_quote_universe(
+        quote_provider,
+        cache_dir=cache_dir,
+        prefer_cache=prefer_cache,
+    )
     eligible = _eligible_symbols_from_quotes(
         list(universe.quotes),
         exclude_chinext=exclude_chinext,
+        max_price=max_price,
     )
     max_size = sizes[-1]
     if max_size > len(eligible):
         raise ValueError(
             f"requested {max_size} symbols, but only {len(eligible)} are eligible"
         )
+    sample_count = max_size
+    if candidate_count is not None:
+        if candidate_count <= 0:
+            raise ValueError("candidate_count must be positive")
+        sample_count = min(max(candidate_count, max_size), len(eligible))
 
     rng = random.Random(seed)
-    sampled = tuple(rng.sample(eligible, max_size))
+    sampled = tuple(rng.sample(eligible, sample_count))
     pools = tuple(
         StockPoolSelection(
             symbols=sampled[:size],
@@ -128,6 +152,7 @@ def select_nested_random_a_share_pools(
             requested_count=size,
             eligible_count=len(eligible),
             exclude_chinext=exclude_chinext,
+            max_price=max_price,
             universe_source=universe.source,
             universe_cache_path=str(universe.cache_path) if universe.cache_path else None,
         )
@@ -139,8 +164,10 @@ def select_nested_random_a_share_pools(
         requested_sizes=sizes,
         eligible_count=len(eligible),
         exclude_chinext=exclude_chinext,
+        max_price=max_price,
         universe_source=universe.source,
         universe_cache_path=str(universe.cache_path) if universe.cache_path else None,
+        candidate_symbols=sampled,
     )
 
 
@@ -155,23 +182,35 @@ def _eligible_symbols_from_quotes(
     quotes: list[Quote],
     *,
     exclude_chinext: bool,
+    max_price: float | None = None,
 ) -> list[str]:
     return sorted(
         {
             normalize_symbol(quote.symbol)
             for quote in quotes
-            if _is_eligible_a_share(quote, exclude_chinext=exclude_chinext)
+            if _is_eligible_a_share(
+                quote,
+                exclude_chinext=exclude_chinext,
+                max_price=max_price,
+            )
         }
     )
 
 
-def _is_eligible_a_share(quote: Quote, *, exclude_chinext: bool) -> bool:
+def _is_eligible_a_share(
+    quote: Quote,
+    *,
+    exclude_chinext: bool,
+    max_price: float | None = None,
+) -> bool:
     code = normalize_symbol(quote.symbol)
     if len(code) != 6:
         return False
     if exclude_chinext and is_chinext_symbol(code):
         return False
     if quote.price <= 0:
+        return False
+    if max_price is not None and quote.price > max_price:
         return False
     return code.startswith(("0", "2", "3", "4", "6", "8"))
 
@@ -180,7 +219,16 @@ def _load_quote_universe(
     provider: QuoteUniverseProvider,
     *,
     cache_dir: Path | None,
+    prefer_cache: bool = False,
 ) -> QuoteUniverse:
+    if prefer_cache and cache_dir is not None:
+        cached = _read_latest_quote_universe_cache(cache_dir)
+        if cached is not None:
+            return QuoteUniverse(
+                quotes=cached.quotes,
+                source="cache",
+                cache_path=cached.cache_path,
+            )
     try:
         quotes = tuple(provider.fetch_spot_quotes())
     except Exception as live_error:

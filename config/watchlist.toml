@@ -33,8 +33,6 @@ symbols = [
 ]
 
 [costs]
-# Keep these configurable. Verify current broker fee, minimum commission,
-# transfer fee, and stamp duty before using in real analysis.
 commission_rate = 0.0
 min_commission = 0.0
 stamp_tax_sell_rate = 0.0

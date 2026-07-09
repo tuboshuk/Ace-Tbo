@@ -132,7 +132,7 @@ def test_volume_probe_follow_through_exit_sells_next_open_after_invalidation() -
         closes=(10.00, 10.10, 9.70),
         changes=(0.0, 1.0, -3.5),
     )
-    broker = _broker_with_volume_buy(bars[1], reason_support=9.80)
+    broker = _broker_with_volume_buy(bars[1], reason_support=9.80, execute_price=10.00)
     discipline = _follow_through_discipline()
 
     decision = discipline.decide_volume_probe_exit(
@@ -152,7 +152,7 @@ def test_volume_probe_follow_through_exit_sells_after_three_bars_without_confirm
         closes=(10.00, 10.00, 10.00, 10.00),
         changes=(0.0, 0.0, 0.0, 0.0),
     )
-    broker = _broker_with_volume_buy(bars[1], reason_support=9.80)
+    broker = _broker_with_volume_buy(bars[1], reason_support=9.80, execute_price=10.00)
     discipline = _follow_through_discipline()
 
     decision = discipline.decide_volume_probe_exit(
@@ -166,6 +166,66 @@ def test_volume_probe_follow_through_exit_sells_after_three_bars_without_confirm
     assert "volume_price_follow_through_exit: no_follow_through" in decision.reason
     assert "hold_bars=3" in decision.reason
     assert "confirmations=0 warnings=0" in decision.reason
+
+
+def test_volume_probe_follow_through_exit_holds_profitable_first_bar_when_required() -> None:
+    bars = _follow_through_bars(
+        closes=(10.00, 10.20),
+        changes=(0.0, 1.0),
+    )
+    broker = _broker_with_volume_buy(bars[1], reason_support=9.80)
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_signal_entries=False,
+            enable_pursuit_probe=False,
+            enable_confirmation_add=False,
+            enable_volume_price_probe=True,
+            enable_volume_price_follow_through_exit=True,
+            volume_price_follow_through_no_confirm_bars=1,
+            volume_price_follow_through_max_hold_bars=5,
+            volume_price_follow_through_first_bar_exit_requires_loss=True,
+        )
+    )
+
+    decision = discipline.decide_volume_probe_exit(
+        "000001",
+        broker,
+        bars=bars,
+        current_index=1,
+    )
+
+    assert decision.side is None
+    assert "first_bar_profitable_trial" in decision.reason
+
+
+def test_volume_probe_follow_through_exit_sells_losing_first_bar_when_required() -> None:
+    bars = _follow_through_bars(
+        closes=(10.00, 9.90),
+        changes=(0.0, -1.0),
+    )
+    broker = _broker_with_volume_buy(bars[1], reason_support=9.80)
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_signal_entries=False,
+            enable_pursuit_probe=False,
+            enable_confirmation_add=False,
+            enable_volume_price_probe=True,
+            enable_volume_price_follow_through_exit=True,
+            volume_price_follow_through_no_confirm_bars=1,
+            volume_price_follow_through_max_hold_bars=5,
+            volume_price_follow_through_first_bar_exit_requires_loss=True,
+        )
+    )
+
+    decision = discipline.decide_volume_probe_exit(
+        "000001",
+        broker,
+        bars=bars,
+        current_index=1,
+    )
+
+    assert decision.side == OrderSide.SELL
+    assert "volume_price_follow_through_exit: no_follow_through" in decision.reason
 
 
 def test_volume_probe_follow_through_exit_holds_confirmed_trial_before_max() -> None:
@@ -207,6 +267,134 @@ def test_volume_probe_follow_through_exit_sells_confirmed_trial_at_max_hold() ->
     assert "volume_price_follow_through_exit: max_hold" in decision.reason
     assert "hold_bars=5" in decision.reason
     assert "confirmations=4" in decision.reason
+
+
+def test_main_force_profile_filter_allows_accumulation_inflow_breakout() -> None:
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_volume_price_probe=True,
+            volume_price_probe_allowed_node_types=("volume_breakout",),
+            enable_volume_price_main_force_profile_filter=True,
+        )
+    )
+
+    decision = discipline.decide_volume_probe(
+        "000001",
+        _passed_volume_context("volume_breakout"),
+        PaperBroker(initial_cash=100000),
+        intent_profile=_profile(
+            stage="accumulation_watch",
+            weekly_trend="up",
+            close_vs_vwap60=1.0,
+            main_flow_5=1_000_000,
+            main_flow_10=2_000_000,
+            distribution_score=35.0,
+        ),
+    )
+
+    assert decision.side == OrderSide.BUY
+    assert decision.reason.startswith("volume_price_trial_entry")
+
+
+def test_main_force_profile_filter_blocks_distribution_or_negative_flow() -> None:
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_volume_price_probe=True,
+            volume_price_probe_allowed_node_types=("volume_breakout",),
+            enable_volume_price_main_force_profile_filter=True,
+        )
+    )
+
+    distribution_decision = discipline.decide_volume_probe(
+        "000001",
+        _passed_volume_context("volume_breakout"),
+        PaperBroker(initial_cash=100000),
+        intent_profile=_profile(
+            stage="distribution_risk",
+            weekly_trend="up",
+            close_vs_vwap60=1.0,
+            main_flow_5=1_000_000,
+            main_flow_10=2_000_000,
+            distribution_score=35.0,
+        ),
+    )
+    weak_flow_decision = discipline.decide_volume_probe(
+        "000001",
+        _passed_volume_context("volume_breakout"),
+        PaperBroker(initial_cash=100000),
+        intent_profile=_profile(
+            stage="accumulation_watch",
+            weekly_trend="up",
+            close_vs_vwap60=1.0,
+            main_flow_5=-1_000_000,
+            main_flow_10=-2_000_000,
+            distribution_score=35.0,
+        ),
+    )
+
+    assert distribution_decision.side is None
+    assert "main_force_profile_filter_stage" in distribution_decision.reason
+    assert weak_flow_decision.side is None
+    assert "main_force_profile_filter_flow_not_positive" in weak_flow_decision.reason
+
+
+def test_weak_main_force_block_blocks_only_clear_distribution_or_weak_flow() -> None:
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_volume_price_probe=True,
+            volume_price_probe_allowed_node_types=("volume_breakout",),
+            enable_volume_price_weak_main_force_block=True,
+        )
+    )
+
+    accumulation_decision = discipline.decide_volume_probe(
+        "000001",
+        _passed_volume_context("volume_breakout"),
+        PaperBroker(initial_cash=100000),
+        intent_profile=_profile(
+            stage="accumulation_watch",
+            weekly_trend="up",
+            close_vs_vwap60=1.0,
+            main_flow_3=-1_000_000,
+            main_flow_5=1_000_000,
+            main_flow_10=2_000_000,
+            distribution_score=35.0,
+        ),
+    )
+    failed_breakout_decision = discipline.decide_volume_probe(
+        "000001",
+        _passed_volume_context("volume_breakout"),
+        PaperBroker(initial_cash=100000),
+        intent_profile=_profile(
+            stage="failed_breakout",
+            weekly_trend="up",
+            close_vs_vwap60=1.0,
+            main_flow_3=1_000_000,
+            main_flow_5=1_000_000,
+            main_flow_10=2_000_000,
+            distribution_score=35.0,
+        ),
+    )
+    weak_flow_decision = discipline.decide_volume_probe(
+        "000001",
+        _passed_volume_context("volume_breakout"),
+        PaperBroker(initial_cash=100000),
+        intent_profile=_profile(
+            stage="markup_confirmed",
+            weekly_trend="up",
+            close_vs_vwap60=1.0,
+            main_flow_3=-1_000_000,
+            main_flow_5=-1_000_000,
+            main_flow_10=2_000_000,
+            distribution_score=35.0,
+        ),
+    )
+
+    assert accumulation_decision.side == OrderSide.BUY
+    assert failed_breakout_decision.side is None
+    assert "weak_main_force_block_stage" in failed_breakout_decision.reason
+    assert weak_flow_decision.side is None
+    assert "weak_main_force_block_negative_flow" in weak_flow_decision.reason
 
 
 def test_volume_probe_opening_gate_cancels_high_open_above_expected_range() -> None:
@@ -449,6 +637,85 @@ def test_breakout_confirmation_entry_cancels_when_confirmation_fails() -> None:
     assert not [item for item in result.fills if item.side == OrderSide.BUY]
 
 
+def test_pre_breakout_watchlist_buys_after_confirmed_breakout() -> None:
+    bars, flows, watch_index, confirmation_index = _pre_breakout_watch_dataset(
+        confirmation_main_flow=800_000.0,
+    )
+
+    result = HistoricalReplayRunner(
+        bars=bars,
+        fund_flows=flows,
+        initial_cash=100000,
+        discipline=_pre_breakout_watchlist_discipline(),
+    ).run()
+
+    watch_records = [
+        item for item in result.decisions
+        if item.reason.startswith("volume_price_pre_breakout_watch:")
+    ]
+    handoff_records = [
+        item for item in result.decisions
+        if "pre_breakout_watchlist_entry" in item.reason
+    ]
+    buy_fills = [item for item in result.fills if item.side == OrderSide.BUY]
+
+    assert watch_records
+    assert watch_records[0].signal_date <= bars[watch_index].trade_date
+    assert handoff_records
+    assert handoff_records[0].signal_date == bars[confirmation_index].trade_date
+    assert handoff_records[0].side == "BUY"
+    assert [item.trade_date for item in buy_fills] == [
+        bars[confirmation_index + 1].trade_date
+    ]
+    assert "watch_node=" in buy_fills[0].reason
+    assert "tier=continuous_confirmation" in buy_fills[0].reason
+
+
+def test_pre_breakout_watchlist_cancels_when_main_flow_turns_weak() -> None:
+    bars, flows, _watch_index, _confirmation_index = _pre_breakout_watch_dataset(
+        confirmation_main_flow=-800_000.0,
+    )
+
+    result = HistoricalReplayRunner(
+        bars=bars,
+        fund_flows=flows,
+        initial_cash=100000,
+        discipline=_pre_breakout_watchlist_discipline(),
+    ).run()
+
+    assert not [item for item in result.fills if item.side == OrderSide.BUY]
+    assert any("main_flow_weak" in item.reason for item in result.decisions)
+
+
+def test_follow_through_exit_sells_when_main_flow_turns_negative() -> None:
+    bars = _follow_through_bars(
+        closes=(10.00, 10.15),
+        changes=(0.0, 1.5),
+    )
+    broker = _broker_with_volume_buy(bars[1], reason_support=9.80)
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_signal_entries=False,
+            enable_pursuit_probe=False,
+            enable_confirmation_add=False,
+            enable_volume_price_probe=True,
+            enable_volume_price_follow_through_exit=True,
+            volume_price_follow_through_exit_on_negative_main_flow=True,
+        )
+    )
+
+    decision = discipline.decide_volume_probe_exit(
+        "000001",
+        broker,
+        bars=bars,
+        current_index=1,
+        main_flow=-1.0,
+    )
+
+    assert decision.side == OrderSide.SELL
+    assert "main_flow_weak" in decision.reason
+
+
 def test_volume_probe_opening_gate_allows_moderate_low_open() -> None:
     bars: list[Bar] = []
     start = date(2026, 1, 1)
@@ -499,6 +766,45 @@ def test_volume_probe_risk_sizing_caps_low_support_distance() -> None:
     assert confirmed.target_weight == 0.12
     assert "volume_price_risk_sized" in confirmed.reason
     assert "weight=12.00%" in confirmed.reason
+
+
+def test_volume_probe_risk_sizing_can_respect_tiered_decision_cap() -> None:
+    bars: list[Bar] = []
+    start = date(2026, 1, 1)
+    _append_base(bars, start)
+    _append_positive_shrink_case(bars, start)
+    _append_base(bars, start)
+    _append_positive_shrink_case(bars, start)
+    _append_base(bars, start)
+    signal_index = len(bars)
+    bars.append(_shrink_bar(start + timedelta(days=signal_index), 10.16))
+    bars.append(_bar(start + timedelta(days=len(bars)), open_price=10.10, close=10.20))
+    discipline = TradeDiscipline(
+        DisciplineConfig(
+            enable_volume_price_probe=True,
+            volume_price_probe_min_cases=2,
+            enable_volume_price_risk_sizing=True,
+            volume_price_account_risk_pct=0.003,
+            volume_price_risk_sizing_max_weight=0.20,
+            volume_price_risk_sizing_respects_decision_cap=True,
+            volume_price_min_stop_distance_pct=0.015,
+        )
+    )
+
+    confirmed = discipline.confirm_volume_probe_opening(
+        decision=TradeDecision(
+            side=OrderSide.BUY,
+            reason="volume_price_trial_entry: node=shrink_pullback",
+            target_weight=0.05,
+        ),
+        bars=bars,
+        signal_index=signal_index,
+        execution_index=signal_index + 1,
+    )
+
+    assert confirmed.side == OrderSide.BUY
+    assert confirmed.target_weight == 0.05
+    assert "weight=5.00%" in confirmed.reason
 
 
 def test_volume_probe_risk_sizing_reduces_wide_support_distance() -> None:
@@ -1200,7 +1506,41 @@ def _breakout_confirmation_discipline() -> TradeDiscipline:
     )
 
 
-def _broker_with_volume_buy(bar: Bar, *, reason_support: float) -> PaperBroker:
+def _pre_breakout_watchlist_discipline() -> TradeDiscipline:
+    return TradeDiscipline(
+        DisciplineConfig(
+            enable_signal_entries=False,
+            enable_pursuit_probe=False,
+            enable_confirmation_add=False,
+            enable_volume_price_probe=True,
+            enable_volume_price_timed_exit=False,
+            enable_volume_price_opening_gate=False,
+            volume_price_probe_allowed_node_types=("volume_breakout",),
+            volume_price_probe_window=5,
+            volume_price_probe_min_cases=99,
+            volume_price_probe_min_win_rate_pct=99.0,
+            volume_price_probe_min_avg_return_pct=99.0,
+            enable_volume_price_pre_breakout_watchlist_entry=True,
+            volume_price_pre_breakout_watch_node_types=(
+                "normal",
+                "dry_up_base",
+                "quiet_consolidation",
+                "shrink_pullback",
+            ),
+            volume_price_pre_breakout_max_age_bars=5,
+            volume_price_pre_breakout_observation_weight=0.05,
+            volume_price_pre_breakout_strong_weight=0.10,
+            volume_price_pre_breakout_continuous_weight=0.15,
+        )
+    )
+
+
+def _broker_with_volume_buy(
+    bar: Bar,
+    *,
+    reason_support: float,
+    execute_price: float | None = None,
+) -> PaperBroker:
     broker = PaperBroker(100000)
     broker.execute_market_order(
         Order(
@@ -1212,7 +1552,7 @@ def _broker_with_volume_buy(bar: Bar, *, reason_support: float) -> PaperBroker:
                 f"volume_price_risk_sized: support={reason_support:.2f}"
             ),
         ),
-        bar.open,
+        execute_price if execute_price is not None else bar.open,
         bar.trade_date,
     )
     return broker
@@ -1279,6 +1619,7 @@ def _profile(
     weekly_trend: str,
     close_vs_vwap60: float | None,
     daily_trend: str = "base_down",
+    main_flow_3: float | None = None,
     main_flow_5: float | None = None,
     main_flow_10: float | None = None,
     distribution_score: float = 40.0,
@@ -1296,7 +1637,7 @@ def _profile(
         close_vs_vwap_120_pct=None,
         turnover_20=None,
         turnover_60=None,
-        main_flow_3=None,
+        main_flow_3=main_flow_3,
         main_flow_5=main_flow_5,
         main_flow_10=main_flow_10,
         obv_slope_20=None,
@@ -1438,6 +1779,52 @@ def _breakout_confirmation_dataset(
         main_flow=confirm_main_flow,
     )
     return bars, flows, signal_index
+
+
+def _pre_breakout_watch_dataset(
+    *,
+    confirmation_main_flow: float,
+) -> tuple[list[Bar], list[FundFlowSnapshot], int, int]:
+    bars: list[Bar] = []
+    start = date(2026, 1, 1)
+    _append_breakout_base(bars, start)
+    watch_index = len(bars)
+    bars.append(_quiet_bar(start + timedelta(days=watch_index), 10.10))
+    confirmation_index = len(bars)
+    bars.append(
+        Bar(
+            symbol="000001",
+            trade_date=start + timedelta(days=confirmation_index),
+            open=10.35,
+            high=10.86,
+            low=10.28,
+            close=10.70,
+            volume=2_500,
+            amount=10.70 * 2_500,
+            change_pct=4.0,
+            turnover_rate=5.0,
+        )
+    )
+    bars.append(
+        Bar(
+            symbol="000001",
+            trade_date=start + timedelta(days=len(bars)),
+            open=10.72,
+            high=10.92,
+            low=10.60,
+            close=10.85,
+            volume=1_500,
+            amount=10.85 * 1_500,
+            change_pct=1.4,
+            turnover_rate=4.0,
+        )
+    )
+    flows = [_flow_for_bar(item, main_flow=200_000.0) for item in bars]
+    flows[confirmation_index] = _flow_for_bar(
+        bars[confirmation_index],
+        main_flow=confirmation_main_flow,
+    )
+    return bars, flows, watch_index, confirmation_index
 
 
 def _breakout_bar(trade_date: date, close: float, *, change_pct: float) -> Bar:

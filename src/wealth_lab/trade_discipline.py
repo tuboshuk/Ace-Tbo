@@ -102,6 +102,20 @@ class DisciplineConfig:
     enable_volume_price_quiet_weekly_down_exception_flow_guard: bool = False
     volume_price_quiet_weekly_down_exception_min_main_flow_10: float | None = None
     volume_price_block_non_breakout_markdown: bool = True
+    enable_volume_price_main_force_profile_filter: bool = False
+    volume_price_main_force_allowed_stages: tuple[str, ...] = (
+        "accumulation_watch",
+        "markup_confirmed",
+    )
+    volume_price_main_force_max_distribution_score: float | None = 55.0
+    volume_price_main_force_require_positive_flow_majority: bool = True
+    enable_volume_price_weak_main_force_block: bool = False
+    volume_price_weak_main_force_block_stages: tuple[str, ...] = (
+        "distribution_risk",
+        "failed_breakout",
+    )
+    volume_price_weak_main_force_min_negative_flow_windows: int = 2
+    volume_price_weak_main_force_distribution_score: float | None = 65.0
     enable_volume_price_support_quality_filter: bool = False
     volume_price_block_dry_up_without_main_flow: bool = False
     volume_price_support_quality_min_dry_up_avg_return_pct: float = 0.35
@@ -138,14 +152,30 @@ class DisciplineConfig:
     enable_volume_price_risk_sizing: bool = False
     volume_price_account_risk_pct: float = 0.003
     volume_price_risk_sizing_max_weight: float = 0.12
+    volume_price_risk_sizing_respects_decision_cap: bool = False
     volume_price_min_stop_distance_pct: float = 0.015
     volume_price_min_raw_stop_upsize_pct: float = 0.0
     volume_price_uncertain_open_weight_factor: float = 0.50
     enable_volume_price_follow_through_exit: bool = False
     volume_price_follow_through_no_confirm_bars: int = 3
     volume_price_follow_through_max_hold_bars: int = 5
+    volume_price_follow_through_first_bar_exit_requires_loss: bool = False
+    volume_price_follow_through_exit_on_negative_main_flow: bool = False
+    volume_price_follow_through_exit_on_profitable_stall: bool = False
     enable_volume_price_breakout_confirmation_entry: bool = False
     volume_price_breakout_confirmation_bars: int = 1
+    enable_volume_price_pre_breakout_watchlist_entry: bool = False
+    volume_price_pre_breakout_watch_node_types: tuple[str, ...] = (
+        "normal",
+        "dry_up_base",
+        "quiet_consolidation",
+        "shrink_pullback",
+    )
+    volume_price_pre_breakout_max_age_bars: int = 5
+    volume_price_pre_breakout_observation_weight: float = 0.05
+    volume_price_pre_breakout_strong_weight: float = 0.10
+    volume_price_pre_breakout_continuous_weight: float = 0.15
+    volume_price_pre_breakout_allow_unknown_flow: bool = True
     volume_price_breakout_max_opening_gap_pct: float | None = None
     volume_price_breakout_wide_support_distance_pct: float | None = None
     volume_price_breakout_min_gap_for_wide_support_pct: float | None = None
@@ -408,6 +438,38 @@ class TradeDiscipline:
                     f"{intent_block}"
                 ),
             )
+        main_force_block = _volume_price_main_force_profile_block_reason(
+            config=self.config,
+            intent_profile=intent_profile,
+        )
+        if main_force_block is not None:
+            return TradeDecision(
+                side=None,
+                reason=(
+                    "volume_price_trial_blocked: "
+                    f"node={context.node.node_type} "
+                    f"cases={context.resolved_cases} "
+                    f"win={_fmt_optional(context.win_rate_pct)}% "
+                    f"avg={_fmt_optional(context.avg_return_pct)}%; "
+                    f"{main_force_block}"
+                ),
+            )
+        weak_main_force_block = _volume_price_weak_main_force_block_reason(
+            config=self.config,
+            intent_profile=intent_profile,
+        )
+        if weak_main_force_block is not None:
+            return TradeDecision(
+                side=None,
+                reason=(
+                    "volume_price_trial_blocked: "
+                    f"node={context.node.node_type} "
+                    f"cases={context.resolved_cases} "
+                    f"win={_fmt_optional(context.win_rate_pct)}% "
+                    f"avg={_fmt_optional(context.avg_return_pct)}%; "
+                    f"{weak_main_force_block}"
+                ),
+            )
         support_quality_block = _volume_price_support_quality_block_reason(
             context=context,
             config=self.config,
@@ -570,12 +632,147 @@ class TradeDiscipline:
             ),
         )
 
+    def should_add_pre_breakout_watch(
+        self,
+        context: VolumeProbeContext,
+        broker: PaperBroker,
+        symbol: str,
+    ) -> bool:
+        """Return whether a non-breakout node should enter the observation pool."""
+
+        if not self.config.enable_volume_price_pre_breakout_watchlist_entry:
+            return False
+        position = broker.positions.get(symbol)
+        if position is not None and position.quantity > 0:
+            return False
+        return (
+            context.node.node_type
+            in self.config.volume_price_pre_breakout_watch_node_types
+        )
+
+    def confirm_pre_breakout_watchlist_entry(
+        self,
+        *,
+        symbol: str,
+        watch_context: VolumeProbeContext,
+        confirmation_context: VolumeProbeContext,
+        bars: list[Bar],
+        watch_index: int,
+        confirmation_index: int,
+        main_flow: float | None = None,
+    ) -> TradeDecision:
+        """Turn a watched node into a breakout trial only after confirmation."""
+
+        if not self.config.enable_volume_price_pre_breakout_watchlist_entry:
+            return TradeDecision(
+                side=None,
+                reason="volume_price_pre_breakout_watch_disabled",
+            )
+        age = confirmation_index - watch_index
+        if age < 1:
+            return TradeDecision(
+                side=None,
+                reason=f"volume_price_pre_breakout_watch_wait: age={age}",
+            )
+        max_age = max(1, self.config.volume_price_pre_breakout_max_age_bars)
+        if age > max_age:
+            return TradeDecision(
+                side=None,
+                reason=(
+                    "volume_price_pre_breakout_watch_cancel: "
+                    f"expired age={age} max_age={max_age} "
+                    f"watch_node={watch_context.node.node_type}"
+                ),
+            )
+        if confirmation_context.node.node_type != "volume_breakout":
+            return TradeDecision(
+                side=None,
+                reason=(
+                    "volume_price_pre_breakout_watch_hold: "
+                    f"watch_node={watch_context.node.node_type} "
+                    f"current_node={confirmation_context.node.node_type} age={age}"
+                ),
+            )
+
+        watch_bar = bars[watch_index]
+        confirmation_bar = bars[confirmation_index]
+        price_stood = confirmation_bar.close >= watch_bar.close
+        if not price_stood:
+            return _cancel_pre_breakout_watch(
+                "price_not_stood",
+                watch_context,
+                confirmation_context,
+                age,
+                main_flow,
+            )
+        volume_expanded = _is_confirmation_volume_expanded(bars, confirmation_index)
+        if not volume_expanded:
+            return _cancel_pre_breakout_watch(
+                "volume_not_expanded",
+                watch_context,
+                confirmation_context,
+                age,
+                main_flow,
+            )
+        if (
+            main_flow is None
+            and not self.config.volume_price_pre_breakout_allow_unknown_flow
+        ):
+            return _cancel_pre_breakout_watch(
+                "main_flow_unknown",
+                watch_context,
+                confirmation_context,
+                age,
+                main_flow,
+            )
+        if main_flow is not None and main_flow < 0:
+            return _cancel_pre_breakout_watch(
+                "main_flow_weak",
+                watch_context,
+                confirmation_context,
+                age,
+                main_flow,
+            )
+
+        tier, target_weight = _pre_breakout_position_tier(
+            config=self.config,
+            bars=bars,
+            watch_index=watch_index,
+            confirmation_index=confirmation_index,
+            confirmation_context=confirmation_context,
+            main_flow=main_flow,
+        )
+        target_weight = min(target_weight, self.config.max_single_position_weight)
+        return TradeDecision(
+            side=OrderSide.BUY,
+            target_weight=target_weight,
+            reason=(
+                "volume_price_trial_entry: "
+                f"node=volume_breakout "
+                f"cases={confirmation_context.resolved_cases} "
+                f"win={_fmt_optional(confirmation_context.win_rate_pct)}% "
+                f"avg={_fmt_optional(confirmation_context.avg_return_pct)}%; "
+                "pre_breakout_watchlist_entry: "
+                f"symbol={symbol} "
+                f"watch_node={watch_context.node.node_type} "
+                f"watch_date={watch_context.as_of_date} "
+                f"age={age} "
+                f"price_stood={price_stood} "
+                f"volume_expanded={volume_expanded} "
+                f"main_flow={_fmt_optional(main_flow)} "
+                f"tier={tier} "
+                f"weight={target_weight * 100:.2f}%; "
+                f"{confirmation_context.reason}"
+            ),
+        )
+
     def decide_volume_probe_exit(
         self,
         symbol: str,
         broker: PaperBroker,
         bars: list[Bar] | None = None,
         current_index: int | None = None,
+        main_flow: float | None = None,
     ) -> TradeDecision:
         """Exit a volume-price trial when its follow-through thesis expires."""
 
@@ -601,6 +798,7 @@ class TradeDiscipline:
                 symbol=symbol,
                 bars=bars,
                 current_index=current_index,
+                main_flow=main_flow,
             )
         return TradeDecision(
             side=OrderSide.SELL,
@@ -1063,6 +1261,95 @@ def _volume_price_quiet_weekly_down_exception_allows(
     )
 
 
+def _volume_price_main_force_profile_block_reason(
+    *,
+    config: DisciplineConfig,
+    intent_profile: MainForceProfile | None,
+) -> str | None:
+    """Return a block reason for the main-force profile research filter."""
+
+    if not config.enable_volume_price_main_force_profile_filter:
+        return None
+    if intent_profile is None:
+        return "main_force_profile_filter_missing_profile"
+    if intent_profile.stage not in config.volume_price_main_force_allowed_stages:
+        return (
+            "main_force_profile_filter_stage:"
+            f"stage={intent_profile.stage}"
+        )
+    max_distribution = config.volume_price_main_force_max_distribution_score
+    if (
+        max_distribution is not None
+        and intent_profile.distribution_score > max_distribution
+    ):
+        return (
+            "main_force_profile_filter_distribution:"
+            f"dist={intent_profile.distribution_score:.1f} "
+            f"max={max_distribution:.1f}"
+        )
+    if config.volume_price_main_force_require_positive_flow_majority:
+        flows = [
+            item
+            for item in (
+                intent_profile.main_flow_3,
+                intent_profile.main_flow_5,
+                intent_profile.main_flow_10,
+            )
+            if item is not None
+        ]
+        if not flows:
+            return "main_force_profile_filter_missing_flow_window"
+        positive = sum(item >= 0 for item in flows)
+        if positive <= len(flows) / 2:
+            return (
+                "main_force_profile_filter_flow_not_positive:"
+                f"positive={positive}/{len(flows)}"
+            )
+    return None
+
+
+def _volume_price_weak_main_force_block_reason(
+    *,
+    config: DisciplineConfig,
+    intent_profile: MainForceProfile | None,
+) -> str | None:
+    """Block only the broad-pool profile combinations with clear weak evidence."""
+
+    if not config.enable_volume_price_weak_main_force_block:
+        return None
+    if intent_profile is None:
+        return None
+    if intent_profile.stage in config.volume_price_weak_main_force_block_stages:
+        return f"weak_main_force_block_stage:stage={intent_profile.stage}"
+    max_distribution = config.volume_price_weak_main_force_distribution_score
+    if (
+        max_distribution is not None
+        and intent_profile.distribution_score >= max_distribution
+    ):
+        return (
+            "weak_main_force_block_distribution:"
+            f"dist={intent_profile.distribution_score:.1f} "
+            f"max={max_distribution:.1f}"
+        )
+    flows = [
+        item
+        for item in (
+            intent_profile.main_flow_3,
+            intent_profile.main_flow_5,
+            intent_profile.main_flow_10,
+        )
+        if item is not None
+    ]
+    negative = sum(item < 0 for item in flows)
+    min_negative = max(1, config.volume_price_weak_main_force_min_negative_flow_windows)
+    if negative >= min_negative:
+        return (
+            "weak_main_force_block_negative_flow:"
+            f"negative={negative}/{len(flows)}"
+        )
+    return None
+
+
 def _volume_price_support_quality_block_reason(
     *,
     context: VolumeProbeContext,
@@ -1373,11 +1660,14 @@ def _apply_volume_price_risk_sizing(
             ),
         )
     risk_weight = config.volume_price_account_risk_pct / sizing_stop_distance_pct
-    target_weight = min(
+    weight_caps = [
         risk_weight,
         config.volume_price_risk_sizing_max_weight,
         config.max_single_position_weight,
-    )
+    ]
+    if config.volume_price_risk_sizing_respects_decision_cap:
+        weight_caps.append(decision.target_weight)
+    target_weight = min(weight_caps)
     if expectation.classification != "expected_open":
         target_weight *= config.volume_price_uncertain_open_weight_factor
     if target_weight <= 0:
@@ -1403,6 +1693,62 @@ def _apply_volume_price_risk_sizing(
     )
 
 
+def _cancel_pre_breakout_watch(
+    reason: str,
+    watch_context: VolumeProbeContext,
+    confirmation_context: VolumeProbeContext,
+    age: int,
+    main_flow: float | None,
+) -> TradeDecision:
+    return TradeDecision(
+        side=None,
+        reason=(
+            "volume_price_pre_breakout_watch_cancel: "
+            f"{reason} watch_node={watch_context.node.node_type} "
+            f"confirm_node={confirmation_context.node.node_type} "
+            f"age={age} main_flow={_fmt_optional(main_flow)}"
+        ),
+    )
+
+
+def _is_confirmation_volume_expanded(bars: list[Bar], index: int) -> bool:
+    if index <= 0:
+        return False
+    history = bars[max(0, index - 5):index]
+    volumes = [bar.volume for bar in history if bar.volume > 0]
+    if not volumes:
+        return False
+    return bars[index].volume >= (sum(volumes) / len(volumes)) * 1.2
+
+
+def _pre_breakout_position_tier(
+    *,
+    config: DisciplineConfig,
+    bars: list[Bar],
+    watch_index: int,
+    confirmation_index: int,
+    confirmation_context: VolumeProbeContext,
+    main_flow: float | None,
+) -> tuple[str, float]:
+    confirmation_bar = bars[confirmation_index]
+    previous_bar = bars[confirmation_index - 1] if confirmation_index > 0 else None
+    continuous_price = (
+        confirmation_index - watch_index >= 2
+        and previous_bar is not None
+        and previous_bar.close >= bars[watch_index].close
+        and confirmation_bar.close >= previous_bar.close
+    )
+    positive_flow = main_flow is not None and main_flow >= 0
+    if continuous_price and positive_flow:
+        return (
+            "continuous_confirmation",
+            config.volume_price_pre_breakout_continuous_weight,
+        )
+    if confirmation_context.passed or positive_flow:
+        return "strong_breakout_confirmation", config.volume_price_pre_breakout_strong_weight
+    return "observation_confirmation", config.volume_price_pre_breakout_observation_weight
+
+
 def _volume_price_follow_through_exit_decision(
     *,
     config: DisciplineConfig,
@@ -1411,6 +1757,7 @@ def _volume_price_follow_through_exit_decision(
     symbol: str,
     bars: list[Bar] | None,
     current_index: int | None,
+    main_flow: float | None,
 ) -> TradeDecision:
     """Hold a breakout trial only while post-entry evidence confirms it."""
 
@@ -1440,12 +1787,54 @@ def _volume_price_follow_through_exit_decision(
         f"support={evidence['support']:.2f} confirmations={evidence['confirmations']} "
         f"warnings={evidence['warnings']} invalidations={evidence['invalidations']}"
     )
+    if (
+        config.volume_price_follow_through_exit_on_negative_main_flow
+        and main_flow is not None
+        and main_flow < 0
+    ):
+        return TradeDecision(
+            side=OrderSide.SELL,
+            reason=(
+                "volume_price_follow_through_exit: main_flow_weak "
+                f"{detail} main_flow={main_flow:.2f}"
+            ),
+        )
     if evidence["invalidations"] > 0:
         return TradeDecision(
             side=OrderSide.SELL,
             reason=f"volume_price_follow_through_exit: invalidated {detail}",
         )
+    current_bar = bars[current_index]
+    current_volume_state = _follow_through_volume_state(bars, current_index)
+    if (
+        config.volume_price_follow_through_exit_on_profitable_stall
+        and current_bar.close > last_buy.price
+        and current_volume_state == "high_volume_stall"
+    ):
+        return TradeDecision(
+            side=OrderSide.SELL,
+            reason=(
+                "volume_price_follow_through_exit: profitable_high_volume_stall "
+                f"{detail} close={current_bar.close:.2f} entry={last_buy.price:.2f}"
+            ),
+        )
     no_confirm_bars = max(1, config.volume_price_follow_through_no_confirm_bars)
+    first_bar_reference = (
+        bars[buy_index - 1].close if buy_index > 0 else min(last_buy.price, position.avg_cost)
+    )
+    if (
+        config.volume_price_follow_through_first_bar_exit_requires_loss
+        and evidence["hold_bars"] <= 1
+        and current_bar.close >= first_bar_reference
+    ):
+        return TradeDecision(
+            side=None,
+            reason=(
+                "volume_price_follow_through_hold: first_bar_profitable_trial "
+                f"{detail} close={current_bar.close:.2f} entry={last_buy.price:.2f} "
+                f"avg_cost={position.avg_cost:.2f} reference={first_bar_reference:.2f}"
+            ),
+        )
     if (
         evidence["hold_bars"] >= no_confirm_bars
         and evidence["confirmations"] <= evidence["warnings"]

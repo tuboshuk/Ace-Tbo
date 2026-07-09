@@ -58,6 +58,7 @@ class ReplayResult:
     total_return: float
     max_drawdown: float
     bars: list[Bar] = field(default_factory=list)
+    fund_flows: list[FundFlowSnapshot] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,14 @@ class _VolumeConfirmationObservation:
     signal_index: int
     context: VolumeProbeContext
     intent_profile: MainForceProfile | None
+
+
+@dataclass(frozen=True)
+class _PreBreakoutWatch:
+    """A non-breakout node waiting for later breakout confirmation."""
+
+    signal_index: int
+    context: VolumeProbeContext
 
 
 class HistoricalReplayRunner:
@@ -120,6 +129,7 @@ class HistoricalReplayRunner:
         pending_decision: TradeDecision | None = None
         pending_signal_index: int | None = None
         pending_volume_observation: _VolumeConfirmationObservation | None = None
+        pending_pre_breakout_watch: _PreBreakoutWatch | None = None
 
         for index, bar in enumerate(self.bars):
             latest_prices[symbol] = bar.open
@@ -225,6 +235,7 @@ class HistoricalReplayRunner:
                         pending_decision = observation_decision.trade_decision
                         pending_signal_index = index
 
+                main_flow = flow.main_net_inflow if flow is not None else None
                 volume_decision = _volume_probe_decision(
                     discipline=self.discipline,
                     bars=self.bars,
@@ -234,7 +245,41 @@ class HistoricalReplayRunner:
                     broker=broker,
                     pending_decision=pending_decision,
                     is_last_bar=index >= len(self.bars) - 1,
+                    main_flow=main_flow,
                 )
+                watch_handoff_consumed = False
+                if pending_pre_breakout_watch is not None:
+                    watch_decision = _pre_breakout_watch_decision(
+                        discipline=self.discipline,
+                        watch=pending_pre_breakout_watch,
+                        confirmation=volume_decision,
+                        bars=self.bars,
+                        index=index,
+                        symbol=symbol,
+                        main_flow=main_flow,
+                        pending_decision=pending_decision,
+                        is_last_bar=index >= len(self.bars) - 1,
+                    )
+                    if watch_decision is not None:
+                        decisions.append(watch_decision.record)
+                        if (
+                            watch_decision.trade_decision.is_trade
+                            and index < len(self.bars) - 1
+                            and pending_decision is None
+                        ):
+                            pending_decision = watch_decision.trade_decision
+                            pending_signal_index = index
+                            watch_handoff_consumed = True
+                        if (
+                            "volume_price_pre_breakout_watch_hold"
+                            not in watch_decision.trade_decision.reason
+                        ):
+                            pending_pre_breakout_watch = None
+                if (
+                    volume_decision.trade_decision.is_trade
+                    and volume_decision.context.node.node_type == "volume_breakout"
+                ):
+                    pending_pre_breakout_watch = None
                 if self.discipline.should_observe_volume_breakout_confirmation_entry(
                     volume_decision.trade_decision,
                     volume_decision.intent_profile,
@@ -249,7 +294,8 @@ class HistoricalReplayRunner:
                         intent_profile=volume_decision.intent_profile,
                     )
                 else:
-                    decisions.append(volume_decision.record)
+                    if not watch_handoff_consumed:
+                        decisions.append(volume_decision.record)
                     if (
                         volume_decision.trade_decision.is_trade
                         and index < len(self.bars) - 1
@@ -257,6 +303,29 @@ class HistoricalReplayRunner:
                     ):
                         pending_decision = volume_decision.trade_decision
                         pending_signal_index = index
+                if (
+                    pending_pre_breakout_watch is None
+                    and pending_decision is None
+                    and not volume_decision.trade_decision.is_trade
+                    and index < len(self.bars) - 1
+                    and self.discipline.should_add_pre_breakout_watch(
+                        volume_decision.context,
+                        broker,
+                        symbol,
+                    )
+                ):
+                    pending_pre_breakout_watch = _PreBreakoutWatch(
+                        signal_index=index,
+                        context=volume_decision.context,
+                    )
+                    decisions.append(
+                        _pre_breakout_watch_record(
+                            symbol=symbol,
+                            bars=self.bars,
+                            index=index,
+                            context=volume_decision.context,
+                        )
+                    )
             equity_curve.append(broker.snapshot(bar.trade_date, latest_prices))
 
         final_value = equity_curve[-1].total_value
@@ -278,6 +347,7 @@ class HistoricalReplayRunner:
             total_return=(final_value / self.initial_cash) - 1,
             max_drawdown=_max_drawdown([snapshot.total_value for snapshot in equity_curve]),
             bars=list(self.bars),
+            fund_flows=list(self.fund_flows),
         )
 
 
@@ -302,6 +372,7 @@ def _volume_probe_decision(
     broker: PaperBroker,
     pending_decision: TradeDecision | None,
     is_last_bar: bool,
+    main_flow: float | None,
 ) -> _VolumeReplayDecision:
     context = discipline.build_volume_probe_context(bars, index)
     intent_profile: MainForceProfile | None = None
@@ -316,6 +387,7 @@ def _volume_probe_decision(
             broker,
             bars=bars,
             current_index=index,
+            main_flow=main_flow,
         )
         intent_profile = (
             build_main_force_profile(bars, fund_flows, index)
@@ -355,6 +427,101 @@ def _volume_probe_decision(
         trade_decision=decision,
         context=context,
         intent_profile=intent_profile,
+    )
+
+
+def _pre_breakout_watch_record(
+    *,
+    symbol: str,
+    bars: list[Bar],
+    index: int,
+    context: VolumeProbeContext,
+) -> ReplayDecision:
+    return ReplayDecision(
+        signal_date=bars[index].trade_date,
+        symbol=symbol,
+        fund_signal="volume_price",
+        pattern_tags=(context.node.node_type,),
+        side=None,
+        reason=(
+            "volume_price_pre_breakout_watch: "
+            f"node={context.node.node_type} "
+            f"cases={context.resolved_cases} "
+            f"win={_fmt_optional(context.win_rate_pct)}% "
+            f"avg={_fmt_optional(context.avg_return_pct)}%; "
+            f"{context.reason}"
+        ),
+        observation_type="volume_price",
+        volume_node=context.node.node_type,
+        volume_probe_passed=context.passed,
+        volume_probe_cases=context.resolved_cases,
+        volume_probe_win_rate_pct=context.win_rate_pct,
+        volume_probe_avg_return_pct=context.avg_return_pct,
+    )
+
+
+def _pre_breakout_watch_decision(
+    *,
+    discipline: TradeDiscipline,
+    watch: _PreBreakoutWatch,
+    confirmation: _VolumeReplayDecision,
+    bars: list[Bar],
+    index: int,
+    symbol: str,
+    main_flow: float | None,
+    pending_decision: TradeDecision | None,
+    is_last_bar: bool,
+) -> _VolumeReplayDecision | None:
+    age = index - watch.signal_index
+    max_age = max(1, discipline.config.volume_price_pre_breakout_max_age_bars)
+    if pending_decision is not None and pending_decision.is_trade:
+        decision = TradeDecision(
+            side=None,
+            reason=(
+                "volume_price_pre_breakout_watch_cancel: "
+                f"pending_signal_trade watch_node={watch.context.node.node_type} "
+                f"age={age}"
+            ),
+        )
+    elif age > max_age or confirmation.context.node.node_type == "volume_breakout":
+        decision = discipline.confirm_pre_breakout_watchlist_entry(
+            symbol=symbol,
+            watch_context=watch.context,
+            confirmation_context=confirmation.context,
+            bars=bars,
+            watch_index=watch.signal_index,
+            confirmation_index=index,
+            main_flow=main_flow,
+        )
+    else:
+        return None
+
+    if is_last_bar and decision.is_trade:
+        decision = TradeDecision(
+            side=None,
+            reason=(
+                "volume_price_pre_breakout_watch_cancel: "
+                f"no_next_bar_for_execution; original={decision.reason}"
+            ),
+        )
+    return _VolumeReplayDecision(
+        record=ReplayDecision(
+            signal_date=bars[index].trade_date,
+            symbol=symbol,
+            fund_signal="volume_price",
+            pattern_tags=(watch.context.node.node_type, confirmation.context.node.node_type),
+            side=decision.side.value if decision.side else None,
+            reason=decision.reason,
+            observation_type="volume_price",
+            volume_node=confirmation.context.node.node_type,
+            volume_probe_passed=confirmation.context.passed,
+            volume_probe_cases=confirmation.context.resolved_cases,
+            volume_probe_win_rate_pct=confirmation.context.win_rate_pct,
+            volume_probe_avg_return_pct=confirmation.context.avg_return_pct,
+        ),
+        trade_decision=decision,
+        context=confirmation.context,
+        intent_profile=confirmation.intent_profile,
     )
 
 
@@ -481,3 +648,9 @@ def _max_drawdown(values: list[float]) -> float:
         drawdown = (peak - value) / peak if peak else 0.0
         worst = max(worst, drawdown)
     return worst
+
+
+def _fmt_optional(value: float | None) -> str:
+    if value is None:
+        return "NA"
+    return f"{value:.2f}"
